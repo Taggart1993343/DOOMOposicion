@@ -1,0 +1,2 @@
+﻿Opcional: para jugar con Brutal Doom (Jugar_Brutal.bat), pon aquí su archivo .pk3.
+Brutal Doom es de Sergeant_Mark_IV y no se incluye: https://www.moddb.com/mods/brutal-doom

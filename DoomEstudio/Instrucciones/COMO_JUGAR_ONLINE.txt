@@ -1,0 +1,121 @@
+﻿==========================================================
+   DOOM ESTUDIO - CÓMO JUGAR EN COOPERATIVO ONLINE
+==========================================================
+
+Cada jugador responde sus propias preguntas. Podéis ser de 2 a 8.
+
+
+----------------------------------------------------------
+ 1. PREPARACIÓN (solo la primera vez, TODOS los jugadores)
+----------------------------------------------------------
+
+ a) Tener la carpeta del juego COMPLETA e IGUAL que la
+    del anfitrión. Lo más fácil: que el anfitrión la comprima
+    en un .zip y se la pase a los demás.
+    Si un archivo es distinto (otra versión del mod, otro WAD...),
+    la partida no conecta o se desincroniza.
+
+ b) Instalar Radmin VPN (gratis) SOLO desde la web oficial:
+        https://www.radmin-vpn.com/
+
+ c) Cuando Windows pregunte por la red nueva de Radmin,
+    elegir "Pública" (así no se comparten tus carpetas).
+
+
+----------------------------------------------------------
+ 2. CREAR LA RED EN RADMIN (lo hace el ANFITRIÓN, una vez)
+----------------------------------------------------------
+
+ 1. Abre Radmin VPN.
+ 2. Menú "Red" > "Crear red".
+ 3. Pon un nombre de red y una contraseña.
+ 4. Pasa el nombre y la contraseña SOLO a tus amigos.
+
+ Los demás jugadores:
+ 1. Abren Radmin VPN.
+ 2. Menú "Red" > "Unirse a una red existente".
+ 3. Escriben el nombre y la contraseña que les has pasado.
+
+ NO os unáis a las redes públicas de "gaming" de Radmin.
+
+
+----------------------------------------------------------
+ 3. CREAR LA PARTIDA (ANFITRIÓN)
+----------------------------------------------------------
+
+ 1. En Radmin, mira TU IP (el número que sale junto a tu
+    nombre, tipo 26.xxx.xxx.xxx) y pásasela a los demás.
+ 2. Haz doble clic en:   Crear_Partida_Online.bat
+ 3. Escribe cuántos jugadores sois EN TOTAL, contándote a ti.
+ 4. Elige si jugáis con Brutal Doom (s) o sin él (n).
+ 5. Se abre el juego y espera a que se unan todos.
+    El mapa sale al azar (te lo dice la ventana negra) y los
+    demás entran en ese mismo mapa.
+ 6. Cuando estéis todos, empieza la partida y te sale a TI el
+    menú de dificultad (Fácil / Normal / Ultrapesadilla).
+    La que elijas vale para todos.
+
+
+----------------------------------------------------------
+ 4. UNIRSE A LA PARTIDA (RESTO DE JUGADORES)
+----------------------------------------------------------
+
+ 1. Comprueba en Radmin que estás en la red del anfitrión
+    y que su nombre sale con el puntito verde.
+ 2. Haz doble clic en:   Unirse_Partida_Online.bat
+ 3. Escribe la IP de Radmin del anfitrión (26.xxx.xxx.xxx).
+ 4. Elige lo MISMO que el anfitrión: con Brutal Doom (s)
+    o sin él (n).
+ 5. Espera a que conecten todos. Mientras el anfitrión elige
+    la dificultad, arriba pone "EL ANFITRION ESTA ELIGIENDO...".
+
+
+----------------------------------------------------------
+ 5. DURANTE LA PARTIDA
+----------------------------------------------------------
+
+ - El juego NO se pausa mientras respondes: que te cubra
+   tu compañero.
+ - Teclas: E interactuar/recoger, R recargar, L libro de
+   repaso, T tomo del temario, N guia de navegacion,
+   P pregunta de repaso (solo en FACIL).
+ - FACIL es el modo estudio: cada jugador elige sus temas
+   al empezar, y su progreso (libro de repaso y preguntas
+   dominadas) se guarda en SU ordenador.
+ - Guia de navegacion (N): cada jugador ve SOLO su propio
+   rastro de balizas hasta el siguiente objetivo.
+ - Arriba a la derecha está el marcador de todos.
+ - Para que salga tu nombre: Opciones > Configuración del
+   jugador > Nombre.
+ - Si mueres, reapareces en el mismo mapa a los 3 segundos
+   (o pulsando E). Los demás siguen jugando.
+ - Ultrapesadilla: si pierdes tus 3 vidas de pregunta,
+   mueres y reapareces (los demás siguen jugando).
+
+
+----------------------------------------------------------
+ 6. SI ALGO FALLA
+----------------------------------------------------------
+
+ - Se queda "esperando" y no conecta:
+     * Revisa que la IP sea la de Radmin del anfitrión
+       (empieza por 26.) y no otra.
+     * En Radmin, haz clic derecho sobre el anfitrión > "Ping".
+       Si no responde, el problema es la red, no el juego.
+     * Si Windows preguntó por el firewall al abrir GZDoom,
+       hay que darle a "Permitir acceso".
+     * El número de jugadores que puso el anfitrión tiene que
+       coincidir con los que os unís. Si pone 3 y sois 2,
+       se queda esperando al tercero.
+
+ - Error de que los archivos no coinciden / se desincroniza:
+     * Las carpetas no son iguales. Que el anfitrión vuelva a
+       pasar su carpeta entera (sobre todo las carpetas Mod y Temarios:
+       todos tienen que elegir el mismo temario).
+     * Uno ha elegido Brutal Doom y otro no.
+
+ - Va a tirones: es la conexión. Funciona mejor con cable
+   que por wifi.
+
+ - Para salir: tecla ESC > Salir. Al acabar, desconéctate
+   de la red de Radmin.

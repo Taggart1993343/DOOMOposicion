@@ -1,0 +1,13 @@
+﻿# MENÚ DE TEMAS de este temario (sale al elegir FÁCIL o con la tecla M).
+#
+# NOMBRE = nombre del temario: sale arriba en el menú y en la consola.
+# [GRUPO] empieza un grupo. Debajo, una línea por tema:   CLAVE = Título que se ve
+# Las preguntas cuyo bloque empieza por la CLAVE van a ese tema: "T1 Geografía" va a T1.
+# Un tema puede tener varias claves separadas por comas:  T3, Inglés = 3. Inglés
+# Si no hay temas.txt, cada bloque de preguntas sale como un tema.
+#
+NOMBRE = Ejemplo
+
+[PRIMERA PARTE]
+T1 = 1. Tema 1 - Geografía
+T2 = 2. Tema 2 - Historia

@@ -1,0 +1,8 @@
+GameInfo
+{
+	AddEventHandlers = "GCQuiz"
+	MessageBoxClass = "GCMessageBox"     // aviso de repasos al salir
+}
+
+// Mapas de DOOM sin el texto de fin de episodio al empezar de nuevo en otro episodio tras morir
+include "motor/mapas.txt"

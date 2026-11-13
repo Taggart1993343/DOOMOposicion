@@ -1,0 +1,4202 @@
+version "4.10"
+
+#include "guia.zsc"
+
+// ============================================================
+//  DOOM ESTUDIO - motor del mod de estudio (sin preguntas)
+//  Puertas, objetos y recargas exigen responder preguntas de un
+//  temario que va aparte: una carpeta (o .pk3) con estudio/preguntas.txt
+//  y, si se quiere, estudio/temas.txt, temario.txt, articulos.txt.
+//  Se pueden cargar varios temarios a la vez: se suman.
+//  Funciona en solitario y en cooperativo online: cada jugador
+//  tiene sus propias preguntas, libro, vidas y puntuación.
+// ============================================================
+
+// Estado de un jugador
+class GCPlayerState
+{
+	Array<int> order;        // su orden barajado de preguntas
+	int orderPos;
+	int askSerial;           // sube cada vez que hay que abrirle el menú
+	int kind;                // 0 = nada, 1 = puerta, 2 = recarga, 3 = objeto, 4 = pregunta voluntaria (P)
+	Inventory pendingItem;   // objeto de la pregunta actual
+	int doorIdx;             // línea de la puerta preguntada (-1 ninguna)
+	String qBlock, qText, qExpl;
+	String opt[4];
+	int correctIdx;
+	int curIdx;              // índice en el banco de la pregunta actual
+	int hintMask;            // opciones descartadas como pista (fácil): bit i = opción i
+	int itemType;            // tipo del objeto de la pregunta actual
+	Array<int> failedIdx;    // LIBRO DE REPASO: sus preguntas falladas
+	Array<int> failNeed;     // (paralelo a failedIdx) aciertos seguidos que faltan para sacarla del libro
+	Array<int> failDue;      // (paralelo a failedIdx) a partir de qué pregunta vuelve a salir (fácil)
+	Array<int> mastery;      // por pregunta del banco: CAJA del repaso por días (0 nueva o fallada, 1-5 acertada en 1-5 días distintos; dominada desde la 3)
+	Array<int> due;          // (paralelo) día en que le toca volver a salir; 0 = nunca ha salido
+	int today;               // día de hoy en este ordenador (lo manda su interfaz); 0 = aún no se sabe
+	bool golden;             // la pregunta actual es dorada (en secreto: se descubre al acertarla)
+	int qCount;              // preguntas que le han salido: el "reloj" del repaso espaciado
+	int ssgTics;             // al empezar: durante este tiempo se asegura que tienes la súper escopeta en la mano
+	bool trimPending;        // partida nueva (inventario recién dado): falta dejar la munición inicial en lo justo
+	Array<int> snapAmt;      // munición de reserva al entrar al nivel (Brutal Doom regala balas en el primer segundo)
+	bool snapValid;
+	// progreso guardado entre partidas (cvar gcq_progreso de cada ordenador)
+	bool progLoaded;
+	String progBuf;
+	String progForeign;      // progreso guardado de preguntas que no están cargadas (otros temarios): se conserva
+	int progSerial;          // sube cada vez que cambia algo que hay que guardar
+	// temas elegidos para estudiar (fácil)
+	Array<int> temaOn;       // por bloque del banco: 1 = entra
+	bool temaFilter;         // hay algún bloque desactivado
+	bool soloFechas;         // fácil: solo preguntas de fechas, de todos los temas
+	// resumen del nivel: lv = nivel actual, pv = el anterior
+	Array<int> lvHit, lvMiss, lvFailed;
+	int lvAsked;
+	Array<int> pvHit, pvMiss, pvFailed;
+	int pvAsked, pvSerial;
+	String pvMap;
+	Array<int> solved;       // puertas que ya ha desbloqueado
+	Array<Inventory> unlocked; // objetos que se quedan en el suelo (cooperativo) y ya acertó
+	int cooldown;
+	int score, hits, misses;
+	int qLives;              // vidas de pregunta (ultrapesadilla)
+	int deadTics;            // tics que lleva muerto (-1 = vivo)
+	bool wantRespawn;        // ha pulsado E estando muerto: empezar ya
+	// PvP (deathmatch): marcador de la ronda y la pregunta para reaparecer
+	int dmKills, dmHits, dmMiss;   // enemigos matados, aciertos y fallos en esta ronda
+	int dmFragBase;          // muertes que ya llevaba al empezar la ronda (las cuenta el juego)
+	bool dmAsked;            // ya se le ha hecho la pregunta de esta muerte
+	int dmWait;              // tras fallar (o no contestar): tics que faltan para reaparecer
+	int dmBonus;             // al reaparecer: 1 = acertó (armadura), 2 = dorada (megaesfera)
+	bool dmSkipped;          // salió de la pregunta sin contestar
+	// lo que se ve en su pantalla
+	Inventory promptItem, bookItem, tomoItem;
+	bool promptVisible, doorPrompt;
+	int promptType;          // 0 munición, 1 arma, 2 llave, 3 salud
+	bool instaReady, hasBook, hasTomo;
+	// GUIA DE NAVEGACION (tecla N): ruta hasta el siguiente objetivo
+	bool guia;
+	int gTic;                // tic del último cálculo
+	int gObj, gLine;         // objetivo (GCNav.OBJ_*) y su línea
+	int gKey, gStep;         // guía: color de la llave o puerta objetivo (1 roja, 2 azul, 4 amarilla) y qué hay que hacer en ella
+	bool hard;               // pregunta difícil (llaves): sin pistas, de las que más te cuestan
+	int keyStreak;           // llaves: aciertos seguidos que llevas (hacen falta 3)
+	Array<int> keyUsed;      // llaves: preguntas que ya han salido en esta tanda
+	bool gBoss, gExplore;    // jefe / ruta de exploración (no se sabe el camino exacto)
+	int gMiss;               // cálculos seguidos sin encontrar nada
+	Array<int> gVisited;     // interruptores ya visitados al explorar
+	Array<double> rx, ry, rz; // puntos de la ruta
+	Array<int> rj;           // 1 = se llega por teletransporte, 2 = sin camino (línea recta)
+	Array<int> sk, sp, sl;   // pasos: tipo (GCNav.A_*), punto de la ruta y línea
+	Array<int> rv;           // 1 = ese punto de la ruta se ve desde donde estás
+}
+
+class GCQuiz : StaticEventHandler
+{
+	Array<String> bank;      // líneas válidas del banco
+	Array<String> bankKey;   // clave de cada pregunta para guardar el progreso (hash del enunciado y la respuesta)
+	Array<String> oldKey;    // claves de la versión anterior de cada pregunta (estudio/antiguas.txt), mismo orden
+	String temarioName;      // NOMBRE = ... de estudio/temas.txt (vacío si no lo pone)
+	bool sinTemario;         // no se ha cargado ningún temario: solo hay la pregunta de aviso
+	Array<int> bankBlock;    // bloque de cada pregunta (índice en blocks)
+	Array<String> blocks;    // bloques del banco en orden de aparición (Constitución, T1 Europa...)
+	Array<int> bankFecha;    // 1 = pregunta de fechas (para la opción SOLO FECHAS del menú de temas)
+	// temas de los artículos (estudio/articulos.txt) para el modo fácil
+	Array<String> docKey, docWords;
+	Array<String> artDoc, artTema;
+	Array<int> artNum;
+	Array<GCPlayerState> ps; // un estado por jugador (MAXPLAYERS huecos)
+	Array<Inventory> locked; // armas, munición, llaves y salud del mapa bloqueadas
+	bool needBook;           // colocar el libro al empezar el nivel
+	bool needTomo;           // esconder el tomo del temario en una zona secreta
+	int tomoHint;            // tics que queda el aviso de "hay un tomo escondido"
+	bool bypass;
+	int difficulty;          // -1 sin elegir, 0 fácil, 1 normal, 2 ultrapesadilla
+	bool restarting;         // solitario: ya se ha pedido empezar de nuevo en otro mapa
+	// PvP (deathmatch): ronda por tiempo y cambio a otro de los mapas PvP
+	int dmEndTic;            // tic en que acaba la ronda (0 = aún sin fijar)
+	int dmOverTic;           // > 0: la ronda acabó en este tic (pantalla de resultados)
+	bool dmChanging;         // ya se ha pedido el cambio de mapa
+	String dmNext;           // siguiente mapa
+	GCNav nav;               // guía de navegación
+	ui int uiSeen;
+	ui int hudY;              // primera fila libre debajo del marcador de arriba a la izquierda
+	ui int diaSent, diaCheck;
+	ui GCTiempo tiempo;      // tiempo jugado (se guarda en el .ini)
+	ui bool diffShown;
+	ui bool botsShown;       // PvP en solitario: menú para añadir bots (una vez por sesión)
+	ui GCGuiaDraw guiaDraw;
+	// escasez: objetos recién aparecidos que aún hay que decidir si se quedan
+	Array<Actor> scarceItem;
+	Array<int> scarceTic;
+	Array<int> scarceLate;
+	Array<Actor> scarceDone;     // rifles puestos en lugar de una ametralladora: ya decididos
+	bool mapReady;
+	ui bool progSent, temasSent, temasShown;
+	ui int progPos, progSaved, pvSeen;
+	ui String progOut;
+
+	// ---------- carga del banco ----------
+	override void OnRegister()
+	{
+		difficulty = -1;
+		ps.Resize(MAXPLAYERS);
+		// todos los temarios cargados (carpetas o .pk3 con estudio/preguntas.txt), uno detrás de otro
+		Array<String> lines;
+		int packs = 0;
+		for (int lmp = Wads.FindLumpFullName("estudio/preguntas.txt", 0); lmp >= 0; lmp = Wads.FindLumpFullName("estudio/preguntas.txt", lmp + 1))
+		{
+			Array<String> ls;
+			GCTexto.Texto(lmp).Split(ls, "\n");
+			for (int i = 0; i < ls.Size(); i++) lines.Push(ls[i]);
+			packs++;
+		}
+		for (int i = 0; i < lines.Size(); i++)
+		{
+			String ln = lines[i];
+			ln.Replace("\r", "");
+			if (ln.Left(1) == "#") continue;
+			Array<String> p;
+			ln.Split(p, "|");
+			if (p.Size() < 6) continue;
+			if (bank.Find(ln) != bank.Size()) continue;      // la misma pregunta en dos temarios: una vez
+			bank.Push(ln);
+			String blk = p[0];
+			int b = blocks.Find(blk);
+			if (b == blocks.Size()) blocks.Push(blk);
+			bankBlock.Push(b);
+			bankKey.Push(String.Format("%07x%07x", Hash(p[1] .. "|" .. p[2], 31), Hash(p[2] .. "#" .. p[1], 37)));
+			bankFecha.Push(EsFecha(p) ? 1 : 0);
+		}
+		// sin temario: una sola pregunta que explica dónde se ponen (así el juego no se queda sin preguntas)
+		if (bank.Size() == 0)
+		{
+			sinTemario = true;
+			String aviso = "Sin temario|No hay ningún temario cargado. ¿Dónde se ponen las preguntas?"
+				.. "|En la carpeta Temarios, en estudio/preguntas.txt|Dentro de DoomEstudio.pk3|En la configuración de GZDoom|No se pueden poner preguntas"
+				.. "|Copia la carpeta Temarios/_Plantilla, cámbiale el nombre y escribe tus preguntas en estudio/preguntas.txt.";
+			Array<String> p;
+			aviso.Split(p, "|");
+			bank.Push(aviso); blocks.Push(p[0]); bankBlock.Push(0); bankFecha.Push(0);
+			bankKey.Push(String.Format("%07x%07x", Hash(p[1] .. "|" .. p[2], 31), Hash(p[2] .. "#" .. p[1], 37)));
+		}
+		// nombre del temario (NOMBRE = ... en estudio/temas.txt; si hay varios, se juntan)
+		for (int lt = Wads.FindLumpFullName("estudio/temas.txt", 0); lt >= 0; lt = Wads.FindLumpFullName("estudio/temas.txt", lt + 1))
+		{
+			Array<String> tl;
+			GCTexto.Texto(lt).Split(tl, "\n");
+			for (int i = 0; i < tl.Size(); i++)
+			{
+				String l = tl[i];
+				l.Replace("\r", "");
+				int eq = l.IndexOf("=");
+				if (eq < 0 || l.Left(1) == "#") continue;
+				String k = l.Left(eq); k.StripRight(); k.StripLeft();
+				if (!(k ~== "NOMBRE")) continue;
+				String v = l.Mid(eq + 1); v.StripRight(); v.StripLeft();
+				temarioName = temarioName == "" ? v : temarioName .. " + " .. v;
+			}
+		}
+		// Preguntas reescritas: el progreso guardado con su versión anterior se sigue reconociendo
+		// (antiguas.txt va en el mismo orden que preguntas.txt, así que solo vale con un temario)
+		int lo = packs == 1 ? Wads.CheckNumForFullName("estudio/antiguas.txt") : -1;
+		if (lo >= 0)
+		{
+			Array<String> ol;
+			GCTexto.Texto(lo).Split(ol, "\n");
+			for (int i = 0; i < ol.Size(); i++)
+			{
+				if (ol[i].Left(1) == "#") continue;
+				Array<String> p;
+				ol[i].Split(p, "|");
+				if (p.Size() < 2) continue;
+				oldKey.Push(String.Format("%07x%07x", Hash(p[0] .. "|" .. p[1], 31), Hash(p[1] .. "#" .. p[0], 37)));
+			}
+		}
+		LoadArticulos();
+	}
+
+	// ¿Es una pregunta de fechas? Sí si la respuesta correcta lleva un año (1500-2099) o un mes
+	// ("6 de diciembre de 1978", "1844", "En septiembre"), o si la pregunta pide el año o la fecha.
+	// A mano: "fecha" o "nofecha" en un campo después de la explicación.
+	static bool EsFecha(Array<String> p)
+	{
+		for (int i = 7; i < p.Size(); i++)
+		{
+			String t = p[i];
+			t.StripRight();
+			if (t ~== "nofecha") return false;
+			if (t ~== "fecha") return true;
+		}
+		String a = GCTexto.Lower(p[2]), q = GCTexto.Lower(p[1]);
+		int n = a.Length();
+		for (int i = 0; i + 4 <= n; i++)
+		{
+			bool d4 = true;
+			for (int j = 0; j < 4; j++) { int c = a.ByteAt(i + j); if (c < 0x30 || c > 0x39) d4 = false; }
+			if (!d4) continue;
+			bool sep = (i == 0 || a.ByteAt(i - 1) < 0x30 || a.ByteAt(i - 1) > 0x39) && (i + 4 == n || a.ByteAt(i + 4) < 0x30 || a.ByteAt(i + 4) > 0x39);
+			int y = a.Mid(i, 4).ToInt();
+			if (sep && y >= 1500 && y <= 2099) return true;
+		}
+		static const String meses[] = { "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+			"septiembre", "setiembre", "octubre", "noviembre", "diciembre" };
+		for (int m = 0; m < meses.Size(); m++) if (HasWord(a, meses[m])) return true;
+		return q.IndexOf("en qué año") >= 0 || q.IndexOf("qué fecha") >= 0;
+	}
+
+	// Hash de 25 bits (h * mul nunca desborda el entero)
+	clearscope static int Hash(String s, int mul)
+	{
+		int h = 5381;
+		for (int i = 0; i < s.Length(); i++) h = (h * mul + s.ByteAt(i)) & 0x1FFFFFF;
+		return h;
+	}
+
+	// ---------- temas de los artículos (modo fácil) ----------
+	void LoadArticulos()
+	{
+		Array<String> lines;
+		for (int lmp = Wads.FindLumpFullName("estudio/articulos.txt", 0); lmp >= 0; lmp = Wads.FindLumpFullName("estudio/articulos.txt", lmp + 1))
+		{
+			Array<String> ls;
+			GCTexto.Texto(lmp).Split(ls, "\n");
+			for (int i = 0; i < ls.Size(); i++) lines.Push(ls[i]);
+		}
+		for (int i = 0; i < lines.Size(); i++)
+		{
+			String l = lines[i];
+			l.StripRight();
+			if (l.Length() == 0 || l.Left(1) == "#") continue;
+			Array<String> p;
+			l.Split(p, "|");
+			if (p.Size() < 2) continue;
+			if (l.Left(1) == "@") { docKey.Push(p[0].Mid(1)); docWords.Push(p[1]); continue; }
+			if (p.Size() < 3 || p[1].ToInt() <= 0) continue;
+			artDoc.Push(p[0]); artNum.Push(p[1].ToInt()); artTema.Push(p[2]);
+		}
+	}
+
+	clearscope static bool IsLetter(int c)
+	{
+		return (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c >= 0x80;
+	}
+
+	// ¿Aparece w en el texto como palabra suelta? (para no confundir "CE" con otras palabras)
+	clearscope static bool HasWord(String text, String w)
+	{
+		int from = 0;
+		while (true)
+		{
+			int at = text.IndexOf(w, from);
+			if (at < 0) return false;
+			int e = at + w.Length();
+			bool okL = at == 0 || !IsLetter(text.ByteAt(at - 1));
+			bool okR = e >= text.Length() || !IsLetter(text.ByteAt(e));
+			if (okL && okR) return true;
+			from = at + 1;
+		}
+		return false;
+	}
+
+	// Documento al que se refiere la pregunta (DUDH, CE...), o "" si no se sabe
+	clearscope String DocOf(String text)
+	{
+		for (int d = 0; d < docKey.Size(); d++)
+		{
+			Array<String> ws;
+			docWords[d].Split(ws, ";");
+			for (int k = 0; k < ws.Size(); k++)
+				if (ws[k].Length() > 0 && HasWord(text, ws[k])) return docKey[d];
+		}
+		return "";
+	}
+
+	// Modo fácil: "Artículo 9" -> "Artículo 9 - detención arbitraria"
+	void AddTopics(GCPlayerState q)
+	{
+		String doc = DocOf(q.qText);
+		if (doc == "") return;
+		for (int i = 0; i < 4; i++)
+		{
+			Array<String> w;
+			q.opt[i].Split(w, " ");
+			if (w.Size() != 2 || !(w[0] == "Artículo" || w[0] == "Articulo" || w[0] == "Art.")) continue;
+			int n = w[1].ToInt();
+			if (n <= 0) continue;
+			for (int k = 0; k < artNum.Size(); k++)
+			{
+				if (artNum[k] != n || artDoc[k] != doc) continue;
+				q.opt[i] = q.opt[i] .. " - " .. artTema[k];
+				break;
+			}
+		}
+	}
+
+	// Estado del jugador n (se crea la primera vez)
+	GCPlayerState P(int n)
+	{
+		if (n < 0 || n >= ps.Size()) return null;
+		if (!ps[n])
+		{
+			let q = new("GCPlayerState");
+			ps[n] = q;
+			q.qLives = 3;
+			q.curIdx = -1;
+			q.mastery.Resize(bank.Size());
+			q.due.Resize(bank.Size());
+			q.temaOn.Resize(blocks.Size());
+			for (int i = 0; i < blocks.Size(); i++) q.temaOn[i] = 1;
+			q.lvHit.Resize(blocks.Size()); q.lvMiss.Resize(blocks.Size());
+			q.pvHit.Resize(blocks.Size()); q.pvMiss.Resize(blocks.Size());
+		}
+		return ps[n];
+	}
+
+	// Para menús y HUD: tu propio estado (puede ser null en el primer instante)
+	clearscope GCPlayerState Me()
+	{
+		if (consoleplayer < 0 || consoleplayer >= ps.Size()) return null;
+		return ps[consoleplayer];
+	}
+
+	void Shuffle(GCPlayerState q)
+	{
+		q.order.Clear();
+		for (int i = 0; i < bank.Size(); i++) q.order.Push(i);
+		for (int i = q.order.Size() - 1; i > 0; i--)
+		{
+			int j = random[GCQ](0, i);
+			int t = q.order[i]; q.order[i] = q.order[j]; q.order[j] = t;
+		}
+		q.orderPos = 0;
+	}
+
+	// ¿Entra esta pregunta en los temas que el jugador ha elegido? (solo en fácil)
+	bool Allowed(GCPlayerState q, int idx)
+	{
+		if (difficulty != 0) return true;
+		if (q.soloFechas) return idx < bankFecha.Size() && bankFecha[idx] != 0;
+		if (!q.temaFilter) return true;
+		int b = bankBlock[idx];
+		return b < 0 || b >= q.temaOn.Size() || q.temaOn[b] != 0;
+	}
+
+	// Fácil, repaso espaciado: la fallada vuelve a las 3-4 preguntas; la que ya tocaba repasar va primero
+	int PickReview(GCPlayerState q, int last)
+	{
+		int best = -1, bestDue = 0x7FFFFFFF;
+		Array<int> any;
+		for (int i = 0; i < q.failedIdx.Size(); i++)
+		{
+			int idx = q.failedIdx[i];
+			if (idx == last || !Allowed(q, idx)) continue;
+			any.Push(idx);
+			if (q.failDue[i] <= q.qCount && q.failDue[i] < bestDue) { bestDue = q.failDue[i]; best = idx; }
+		}
+		if (best >= 0 && random[GCQ](1, 10) <= 8) return best;
+		if (any.Size() > 0 && random[GCQ](1, 100) <= 15) return any[random[GCQ](0, any.Size() - 1)];
+		return -1;
+	}
+
+	// Llaves: preguntas difíciles = las que más te cuestan. Primero las que has fallado, luego las que aún
+	// no dominas o no has visto, y si ya lo dominas todo, cualquiera. Sin repetir dentro de la misma tanda.
+	const LLAVE_RACHA = 3;
+	int PickHard(GCPlayerState q, int last)
+	{
+		Array<int> t1, t2, t3;
+		for (int i = 0; i < bank.Size(); i++)
+		{
+			if (i == last || !Allowed(q, i) || q.keyUsed.Find(i) != q.keyUsed.Size()) continue;
+			bool failed = q.failedIdx.Find(i) != q.failedIdx.Size() || (i < q.due.Size() && q.due[i] > 0 && q.mastery[i] == 0);
+			if (failed) t1.Push(i);
+			else if (i < q.mastery.Size() && q.mastery[i] < DOMINADA) t2.Push(i);
+			else t3.Push(i);
+		}
+		if (t1.Size() > 0) return t1[random[GCQ](0, t1.Size() - 1)];
+		if (t2.Size() > 0) return t2[random[GCQ](0, t2.Size() - 1)];
+		if (t3.Size() > 0) return t3[random[GCQ](0, t3.Size() - 1)];
+		return -1;
+	}
+
+	// ---------- repaso por días (reaprendizaje sucesivo) ----------
+	// mastery = caja. Al acertar una pregunta nueva, fallada o que ya le tocaba, sube de caja y vuelve dentro
+	// de 1, 3, 7, 14 o 30 días. Acertarla otra vez antes de su día no sube nada: cuenta acertar en días
+	// distintos. Dominada = caja 3 (acertada en 3 días distintos). Fallar: caja 0 y vuelve mañana.
+	const DOMINADA = 3;
+	const CAJA_MAX = 5;
+
+	clearscope static int Intervalo(int caja)
+	{
+		static const int d[] = { 0, 1, 3, 7, 14, 30 };
+		return d[clamp(caja, 0, 5)];
+	}
+
+	void Promote(GCPlayerState q, int idx)
+	{
+		int t = q.today;
+		if (t <= 0) { if (q.mastery[idx] == 0) q.mastery[idx] = 1; return; }   // sin fecha aún (no debería pasar)
+		if (q.mastery[idx] > 0 && q.due[idx] > t) return;                       // aún no le tocaba: no sube
+		q.mastery[idx] = min(q.mastery[idx] + 1, CAJA_MAX);
+		q.due[idx] = t + Intervalo(q.mastery[idx]);
+	}
+
+	// Preguntas que tocan como muy tarde dentro de 'dias' días (0 = hoy, 1 = mañana)
+	clearscope int Pendientes(GCPlayerState q, int dias)
+	{
+		if (!q || q.today <= 0) return 0;
+		int n = 0, lim = q.today + dias;
+		for (int i = 0; i < q.due.Size(); i++) if (q.due[i] > 0 && q.due[i] <= lim) n++;
+		return n;
+	}
+
+	// Las que tocan hoy salen primero (3 de cada 4 preguntas, para que también salgan nuevas)
+	int PickDue(GCPlayerState q, int last)
+	{
+		if (q.today <= 0) return -1;
+		Array<int> c;
+		for (int i = 0; i < bank.Size(); i++)
+		{
+			if (i == last || q.due[i] <= 0 || q.due[i] > q.today || !Allowed(q, i)) continue;
+			if (difficulty == 0 && q.failedIdx.Find(i) != q.failedIdx.Size()) continue;   // de esas se encarga el libro
+			c.Push(i);
+		}
+		if (c.Size() == 0 || random[GCQ](1, 4) == 4) return -1;
+		return c[random[GCQ](0, c.Size() - 1)];
+	}
+
+	// Día de hoy (hora de este ordenador) como número de días desde 1970
+	clearscope static int DaysFromCivil(int y, int m, int d)
+	{
+		if (m <= 2) y--;
+		int era = (y >= 0 ? y : y - 399) / 400;
+		int yoe = y - era * 400;
+		int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+		int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+		return era * 146097 + doe - 719468;
+	}
+
+	ui static int HoyLocal()
+	{
+		int now = SystemTime.Now();
+		return DaysFromCivil(SystemTime.Format("%Y", now).ToInt(), SystemTime.Format("%m", now).ToInt(), SystemTime.Format("%d", now).ToInt());
+	}
+
+	// Siguiente del orden barajado (en fácil: solo los temas elegidos). Las que ya sabes y aún no te tocan casi no salen.
+	int PickFresh(GCPlayerState q, int last)
+	{
+		int fallback = -1;
+		for (int tries = 0; tries <= bank.Size() * 2 + 1; tries++)
+		{
+			if (q.orderPos >= q.order.Size()) Shuffle(q);
+			int idx = q.order[q.orderPos];
+			q.orderPos++;
+			if (!Allowed(q, idx)) continue;
+			if (fallback < 0) fallback = idx;
+			if (idx == last && bank.Size() > 1) continue;
+			if (q.today > 0 && q.due[idx] > q.today && random[GCQ](1, 4) != 1) continue;   // ya sabida y aún no le toca
+			return idx;
+		}
+		if (fallback >= 0) return fallback;
+		if (q.orderPos >= q.order.Size()) Shuffle(q);
+		int idx = q.order[q.orderPos];
+		q.orderPos++;
+		return idx;
+	}
+
+	// Opciones que se refieren a las demás: van al final
+	// "Las respuestas a) y b) son correctas" -> "Las respuestas 1 y 2 son correctas"
+	static String LetrasANumeros(String t)
+	{
+		t.Replace(" a)", " 1"); t.Replace(" b)", " 2"); t.Replace(" c)", " 3"); t.Replace(" d)", " 4");
+		t.Replace(" A)", " 1"); t.Replace(" B)", " 2"); t.Replace(" C)", " 3"); t.Replace(" D)", " 4");
+		return t;
+	}
+
+	static bool IsMetaOption(String t)
+	{
+		String l = t.MakeLower();
+		return l.Left(5) == "todas" || l.Left(7) == "ninguna" || l.Left(14) == "las respuestas" || l.Left(5) == "ambas";
+	}
+
+	void NextQuestion(GCPlayerState q)
+	{
+		int last = q.curIdx;
+		Array<String> p;
+		q.qCount++;
+		int pick = q.hard ? PickHard(q, last) : -1;
+		if (pick < 0 && difficulty == 0 && !q.hard) pick = PickReview(q, last);
+		if (pick < 0) pick = PickDue(q, last);
+		if (pick < 0) pick = PickFresh(q, last);
+		q.curIdx = pick;
+		if (q.hard) q.keyUsed.Push(pick);
+		bank[q.curIdx].Split(p, "|");
+		q.qBlock = p[0];
+		q.qText = p[1];
+		q.qExpl = (p.Size() > 6) ? p[6] : "";
+		int pos;
+		if (p.Size() > 7 && p[7].Left(5) == "fijo:")
+		{
+			// Orden fijo (opciones como "Las respuestas a) y b) son correctas"): la correcta va en la posición
+			// indicada y las incorrectas, en el orden en que están escritas
+			pos = clamp(p[7].Mid(5).ToInt() - 1, 0, 3);
+			int k = 3;
+			for (int i = 0; i < 4; i++)
+			{
+				if (i == pos) q.opt[i] = p[2];
+				else { q.opt[i] = p[k]; k++; }
+			}
+		}
+		else
+		{
+			// Se barajan, pero "Todas son correctas" o "Ninguna es correcta" van siempre al final
+			Array<String> rest, last;
+			Array<int> restOk, lastOk;
+			for (int i = 2; i <= 5; i++)
+			{
+				if (IsMetaOption(p[i])) { last.Push(p[i]); lastOk.Push(i == 2); }
+				else { rest.Push(p[i]); restOk.Push(i == 2); }
+			}
+			for (int i = rest.Size() - 1; i > 0; i--)
+			{
+				int j = random[GCQ](0, i);
+				String ts = rest[i]; rest[i] = rest[j]; rest[j] = ts;
+				int to = restOk[i]; restOk[i] = restOk[j]; restOk[j] = to;
+			}
+			pos = 0;
+			for (int i = 0; i < 4; i++)
+			{
+				bool fromRest = i < rest.Size();
+				q.opt[i] = fromRest ? rest[i] : last[i - rest.Size()];
+				if (fromRest ? restOk[i] : lastOk[i - rest.Size()]) pos = i;
+			}
+		}
+		q.correctIdx = pos;
+		q.golden = !q.hard && random[GCQ](1, 100) <= 10;    // 1 de cada 10, dorada en secreto (las de llave, no)
+		for (int i = 0; i < 4; i++) if (IsMetaOption(q.opt[i])) q.opt[i] = LetrasANumeros(q.opt[i]);
+		q.hintMask = 0;
+		if (difficulty == 0 && !q.hard)          // las difíciles (llaves) van sin pistas
+		{
+			AddTopics(q);       // fácil: cada artículo con su tema
+			// La ayuda se retira según la vas sabiendo: nueva o fallada, 2 descartadas; acertada una vez, 1; luego ninguna
+			int m = q.mastery[q.curIdx];
+			int nh = (m <= 0) ? 2 : (m == 1) ? 1 : 0;
+			// Si la correcta es "Todas son correctas" o "Las respuestas a) y b)...", las demás opciones son
+			// ciertas: solo se pueden descartar las del tipo "Ninguna es correcta"
+			Array<int> cand;
+			bool metaOk = IsMetaOption(q.opt[pos]);
+			for (int i = 0; i < 4; i++) if (i != pos && (!metaOk || IsMetaOption(q.opt[i]))) cand.Push(i);
+			while (nh > 0 && cand.Size() > 0)
+			{
+				int ci = random[GCQ](0, cand.Size() - 1);
+				q.hintMask |= 1 << cand[ci];
+				cand.Delete(ci);
+				nh--;
+			}
+		}
+	}
+
+	void Ask(GCPlayerState q, int k)
+	{
+		if (bank.Size() == 0 || q.kind != 0) return;
+		q.kind = k;
+		NextQuestion(q);
+		q.askSerial++;
+	}
+
+	void ClearQuestion(GCPlayerState q)
+	{
+		q.kind = 0;
+		q.hard = false;
+		q.doorIdx = -1;
+		q.pendingItem = null;
+	}
+
+	// ---------- puertas ----------
+	static bool IsDoor(int sp)
+	{
+		return sp == 11 || sp == 12 || sp == 13 || sp == 14 || sp == 202 || sp == 249;
+	}
+
+	override void WorldLoaded(WorldEvent e)
+	{
+		for (int i = 0; i < MAXPLAYERS; i++)
+		{
+			let q = P(i);
+			ClearQuestion(q);
+			q.solved.Clear();
+			q.unlocked.Clear();
+			q.cooldown = 0;
+			q.deadTics = -1;
+			q.wantRespawn = false;
+			if (!e.IsSaveGame) q.qLives = 3;
+			q.rx.Clear(); q.ry.Clear(); q.rz.Clear(); q.rj.Clear();
+			q.sk.Clear(); q.sp.Clear(); q.sl.Clear();
+			q.gObj = 0;
+			q.gLine = -1;
+			q.gTic = -1000;
+			q.gVisited.Clear();
+			if (e.IsSaveGame) q.snapValid = false;
+			if (!e.IsSaveGame)
+			{
+				// resumen del nivel: empieza de cero en cada nivel nuevo
+				for (int b = 0; b < q.lvHit.Size(); b++) { q.lvHit[b] = 0; q.lvMiss[b] = 0; }
+				q.lvFailed.Clear();
+				q.lvAsked = 0;
+			}
+		}
+		restarting = false;
+		tomoHint = 0;
+		if (deathmatch)
+		{
+			// PvP: armas y objetos normales (sin escasez ni bloqueos), sin libro, tomo ni guía; ronda nueva
+			// PvP como el modo normal: armas, munición y salud del mapa se cogen con E y una pregunta
+			// (sin escasez: están todos los objetos del mapa, y vuelven a aparecer)
+			needBook = false;
+			needTomo = false;
+			mapReady = true;
+			LockItems();
+			dmEndTic = 0;
+			dmOverTic = 0;
+			dmChanging = false;
+			for (int i = 0; i < MAXPLAYERS; i++)
+			{
+				let q = P(i);
+				q.dmKills = 0; q.dmHits = 0; q.dmMiss = 0;
+				q.dmAsked = false; q.dmWait = 0; q.dmBonus = 0; q.dmSkipped = false;
+				q.dmFragBase = playeringame[i] ? FragsOf(i) : 0;
+				players[i].cheats &= ~CF_TOTALLYFROZEN;
+			}
+			Console.Printf("Modo estudio - PvP: %d preguntas cargadas%s", bank.Size(), temarioName == "" ? "" : " (" .. temarioName .. ")");
+			return;
+		}
+		nav = new("GCNav");
+		nav.Init();
+		if (!e.IsSaveGame)
+		{
+			// todo lo que hay en el mapa al empezar pasa por la escasez
+			let si = ThinkerIterator.Create("Inventory");
+			Inventory sv;
+			while (sv = Inventory(si.Next())) QueueScarce(sv, false);
+		}
+		mapReady = true;
+		LockItems();
+		needBook = !e.IsSaveGame;   // al cargar partida el libro ya está donde lo dejaste
+		needTomo = !e.IsSaveGame;
+		if (sinTemario) Console.Printf("\cgModo estudio: no hay ningún temario cargado (carpeta Temarios). Solo sale la pregunta de aviso.");
+		Console.Printf("Modo estudio activo: %d preguntas cargadas%s", bank.Size(), temarioName == "" ? "" : " (" .. temarioName .. ")");
+	}
+
+	// Al salir del nivel se guarda su resumen para enseñarlo al empezar el siguiente
+	override void WorldUnloaded(WorldEvent e)
+	{
+		mapReady = false;
+		scarceItem.Clear(); scarceTic.Clear(); scarceLate.Clear(); scarceDone.Clear();
+		// solo al pasar a otro nivel (no al cargar partida ni al reiniciar el mismo nivel)
+		if (e.IsSaveGame || e.NextMap == "" || e.NextMap ~== level.MapName || restarting) return;
+		for (int i = 0; i < MAXPLAYERS; i++)
+		{
+			let q = ps[i];
+			if (!q || q.lvAsked <= 0) continue;
+			q.pvHit.Copy(q.lvHit);
+			q.pvMiss.Copy(q.lvMiss);
+			q.pvFailed.Copy(q.lvFailed);
+			q.pvAsked = q.lvAsked;
+			q.pvMap = level.MapName .. " - " .. level.LevelName;
+			q.pvSerial++;
+		}
+	}
+
+	// Cooperativo: al reaparecer tras morir recuperas las vidas de pregunta
+	override void PlayerRespawned(PlayerEvent e)
+	{
+		let q = P(e.PlayerNumber);
+		if (q)
+		{
+			ClearQuestion(q);
+			q.qLives = 3;
+		}
+		if (deathmatch)
+		{
+			// PvP: se reaparece como se empieza en el modo normal (superescopeta y munición justa) + premio de la pregunta
+			DMStart(e.PlayerNumber);
+			DMRespawnBonus(e.PlayerNumber);
+			return;
+		}
+		GiveBDPistol(players[e.PlayerNumber].mo);
+		GiveSSG(players[e.PlayerNumber].mo);
+		P(e.PlayerNumber).ssgTics = 35;
+		MarkFreshStart(e.PlayerNumber);
+		SnapAmmo(P(e.PlayerNumber), players[e.PlayerNumber].mo);
+	}
+
+	// Al empezar cada nivel (y al reiniciarlo) se empieza con la súper escopeta en la mano
+	override void PlayerEntered(PlayerEvent e)
+	{
+		if (deathmatch)
+		{
+			// PvP: se entra con lo normal; si entra a mitad de ronda, sus muertes previas no cuentan
+			let q = P(e.PlayerNumber);
+			q.dmFragBase = FragsOf(e.PlayerNumber);
+			players[e.PlayerNumber].cheats &= ~CF_TOTALLYFROZEN;
+			DMStart(e.PlayerNumber);
+			return;
+		}
+		GiveBDPistol(players[e.PlayerNumber].mo);
+		GiveSSG(players[e.PlayerNumber].mo);
+		P(e.PlayerNumber).ssgTics = 35;
+		MarkFreshStart(e.PlayerNumber);
+		SnapAmmo(P(e.PlayerNumber), players[e.PlayerNumber].mo);
+	}
+
+	// Súper escopeta + al menos 8 cartuchos, y seleccionada.
+	// Brutal Doom tiene la suya ("SSG"); en DOOM normal es la de DOOM II ("SuperShotgun"),
+	// que necesita SuperEscopeta_DOOM2.pk3 (sus gráficos y sonidos, sacados de tu DOOM2.WAD).
+	// Súper escopeta que toca: la de DOOM II, la de Brutal Doom o, con la clase "Purist" de Brutal Doom, la suya
+	static class<Weapon> SSGClass(PlayerPawn pmo)
+	{
+		String tn = "IsPlayingAsPurist";
+		class<Actor> tc = tn;
+		bool purist = tc && pmo && pmo.CountInv((class<Inventory>)(tc)) > 0;
+		String bn = purist ? "PuristSSG" : "SSG";
+		class<Actor> bc = bn;
+		class<Weapon> w = (class<Weapon>)(bc);
+		if (!w) w = "SuperShotgun";
+		// DOOM 1 sin SuperEscopeta_DOOM2.pk3 no tiene los gráficos de la súper escopeta: escopeta normal
+		if (w == "SuperShotgun" && !TexMan.CheckForTexture("SHT2A0", TexMan.Type_Sprite).IsValid()) w = "Shotgun";
+		return w;
+	}
+
+	static void GiveSSG(PlayerPawn pmo)
+	{
+		if (!pmo || !pmo.player) return;
+		class<Weapon> w = SSGClass(pmo);
+		if (!pmo.FindInventory(w)) pmo.A_GiveInventory(w, 1);
+		pmo.A_SelectWeapon(w);
+	}
+
+	// ---------- libro de repaso ----------
+	void SpawnBook(PlayerPawn pmo)
+	{
+		let b = Actor.Spawn("GCLibro", pmo.Vec3Angle(56, pmo.angle), ALLOW_REPLACE);
+		if (!b) return;
+		if (!b.TestMobjLocation()) b.SetOrigin(pmo.pos, false);   // si cae en una pared, a tus pies
+	}
+
+	// ---------- tomo del temario (escondido en una zona secreta) ----------
+	static bool Fits(Sector s, Vector2 p)
+	{
+		Sector t = level.PointInSector(p);
+		if (t == null || t.Index() != s.Index()) return false;
+		return s.ceilingplane.ZatPoint(p) - s.floorplane.ZatPoint(p) >= 24;
+	}
+
+	// Un punto dentro del sector: su centro o, si cae fuera, junto a una de sus paredes
+	static bool, Vector2 SpotIn(Sector s)
+	{
+		Vector2 c = s.centerspot;
+		if (Fits(s, c)) return true, c;
+		for (int i = 0; i < s.lines.Size(); i++)
+		{
+			Line l = s.lines[i];
+			double len = l.delta.Length();
+			if (len < 64) continue;
+			Vector2 n = (l.delta.y, -l.delta.x) / len;      // hacia el lado frontal
+			if (!l.frontsector || l.frontsector.Index() != s.Index()) n = -n;
+			Vector2 q = (l.v1.p + l.v2.p) / 2 + n * 28;
+			if (Fits(s, q)) return true, q;
+		}
+		return false, (0, 0);
+	}
+
+	void SpawnTomo()
+	{
+		let it = ThinkerIterator.Create("GCTomo");
+		if (it.Next()) return;
+		Array<double> px, py;
+		Array<int> si;
+		for (int i = 0; i < level.Sectors.Size(); i++)
+		{
+			Sector s = level.Sectors[i];
+			if (!s.IsSecret()) continue;
+			bool ok; Vector2 p;
+			[ok, p] = SpotIn(s);
+			if (ok) { px.Push(p.x); py.Push(p.y); si.Push(i); }
+		}
+		if (px.Size() == 0) return;     // nivel sin zonas secretas: aquí no hay tomo
+		int k = random[GCQ](0, px.Size() - 1);
+		Sector sec = level.Sectors[si[k]];
+		Vector2 spot = (px[k], py[k]);
+		if (Actor.Spawn("GCTomo", (spot.x, spot.y, sec.floorplane.ZatPoint(spot)), ALLOW_REPLACE))
+			tomoHint = 35 * 7;
+	}
+
+	// Recogida normal (mensaje, sonido, efecto). Si el objeto se queda en el suelo
+	// (cooperativo), vuelve a bloquearse para los demás.
+	static void GiveByTouch(Inventory it, PlayerPawn pmo)
+	{
+		it.bSPECIAL = true;
+		it.Touch(pmo);
+		if (it && !it.Owner) it.bSPECIAL = false;
+	}
+
+	// ---------- armas y munición ----------
+	// ¿La clase del objeto (o alguna de sus clases padre) se llama así?
+	static bool InheritsFrom(Inventory inv, Name cname)
+	{
+		class<Object> c = inv.GetClass();
+		while (c)
+		{
+			if (c.GetClassName() == cname) return true;
+			c = c.GetParentClass();
+		}
+		return false;
+	}
+
+	// Recogida de arma de Brutal Doom (sus armas del suelo son "BDWeaponSpawner")
+	static bool IsWeaponPickup(Inventory inv)
+	{
+		return (inv is "Weapon") || InheritsFrom(inv, 'BDWeaponSpawner');
+	}
+
+	// Botiquines, bonus de salud, esferas y berserk (DOOM normal y Brutal Doom)
+	static bool IsHealthPickup(Inventory inv)
+	{
+		if (InheritsFrom(inv, 'BasicWeaponPickup')) return false;   // spawners invisibles de Brutal Doom
+		if (inv is "Health") return true;
+		Name n = inv.GetClassName();
+		return n == 'Megasphere' || n == 'Berserk' || n == 'LifeSphere' || n == 'EnergySphere' || n == 'BerserkPack';
+	}
+
+	static int GetItemType(Inventory inv)
+	{
+		if (inv is "Key") return 2;
+		if (IsWeaponPickup(inv)) return 1;
+		if (IsHealthPickup(inv)) return 3;
+		return 0;
+	}
+
+	bool Lockable(Inventory inv)
+	{
+		if (!inv || inv.Owner || !inv.bSPECIAL) return false;
+		if (inv is "GCLibro" || inv is "GCTomo") return false;
+		bool weapon = IsWeaponPickup(inv);
+		// Lo que sueltan los enemigos: las armas sí se bloquean, la munición y la salud no
+		if (inv.bDROPPED && !weapon) return false;
+		if (!weapon && !(inv is "Ammo") && !(inv is "Key") && !IsHealthPickup(inv)) return false;
+		return locked.Find(inv) == locked.Size();
+	}
+
+	void LockOne(Inventory inv)
+	{
+		inv.bSPECIAL = false;          // no se puede recoger tocándolo
+		locked.Push(inv);
+	}
+
+	void LockItems()
+	{
+		locked.Clear();
+		let it = ThinkerIterator.Create("Inventory");
+		Inventory inv;
+		while (inv = Inventory(it.Next()))
+			if (Lockable(inv)) LockOne(inv);
+	}
+
+	// Bloquea también lo que aparece después (spawners de Brutal Doom, etc.) antes de que llegues
+	void LockNearby(PlayerPawn pmo)
+	{
+		let bi = BlockThingsIterator.Create(pmo, 192);
+		while (bi.Next())
+		{
+			let inv = Inventory(bi.thing);
+			if (inv && Lockable(inv)) LockOne(inv);
+		}
+	}
+
+	bool Near(Actor pmo, Actor it)
+	{
+		double r = pmo.radius + it.radius + 32;
+		return pmo.Distance2D(it) <= r && abs(pmo.pos.z - it.pos.z) <= max(pmo.height, it.height);
+	}
+
+	void CheckItems(GCPlayerState q, PlayerPawn pmo)
+	{
+		q.bookItem = null;
+		q.tomoItem = null;
+		let bi = BlockThingsIterator.Create(pmo, 96);
+		while (bi.Next())
+		{
+			let b = Inventory(bi.thing);
+			if (!b || b.Owner || !Near(pmo, b)) continue;
+			if (!q.bookItem && b is "GCLibro" && !q.hasBook) q.bookItem = b;
+			if (!q.tomoItem && b is "GCTomo" && !q.hasTomo) q.tomoItem = b;
+		}
+		q.promptItem = null;
+		double best = 1e9;
+		for (int i = locked.Size() - 1; i >= 0; i--)
+		{
+			let it = locked[i];
+			if (!it || it.Owner) { locked.Delete(i); continue; }
+			if (q.unlocked.Find(it) != q.unlocked.Size()) continue;   // ya lo acertó
+			if (it.bInvisible) continue;                              // recogido, esperando a reaparecer (PvP)
+			if (deathmatch && it is "Weapon" && pmo.FindInventory(it.GetClass())) continue;   // PvP: ya tienes esa arma
+			if (!Near(pmo, it)) continue;
+			double d = pmo.Distance2D(it);
+			if (d < best) { best = d; q.promptItem = it; }
+		}
+		q.promptVisible = q.promptItem || q.bookItem || q.tomoItem;
+		if (q.promptItem) q.promptType = GetItemType(q.promptItem);
+	}
+
+	// Línea (puerta, interruptor...) que tienes delante al alcance de la mano
+	Line, int LineInFront(PlayerPawn pmo)
+	{
+		FLineTraceData d;
+		double vh = pmo.player ? pmo.player.viewheight : pmo.height * 0.75;
+		if (pmo.LineTrace(pmo.angle, 64, pmo.pitch, TRF_THRUACTORS, vh, 0, 0, d)
+			&& d.HitType == FLineTraceData.TRACE_HitWall && d.HitLine && d.HitLine.special != 0)
+			return d.HitLine, d.LineSide;
+		return null, 0;
+	}
+
+	override void WorldLinePreActivated(WorldEvent e)
+	{
+		if (bypass || !e.ActivatedLine || deathmatch) return;    // en PvP las puertas no preguntan
+		Line ln = e.ActivatedLine;
+		if (!IsDoor(ln.special)) return;
+		if (!(e.ActivationType & (SPAC_Use | SPAC_UseThrough | SPAC_UseBack | SPAC_Push))) return;
+		let pmo = PlayerPawn(e.Thing);
+		if (!pmo || !pmo.player || bank.Size() == 0) return;
+		let q = P(pmo.PlayerNumber());
+		if (!q) return;
+		if (q.solved.Find(ln.Index()) != q.solved.Size())
+		{
+			// Ya resuelta por este jugador: las de llave se le abren sin llave
+			if (ln.special == 13 || ln.locknumber > 0)
+			{
+				e.ShouldActivate = false;
+				OpenDoor(pmo, ln);
+			}
+			return;
+		}
+		e.ShouldActivate = false;
+		if (q.kind == 0 && q.cooldown <= 0)
+		{
+			q.doorIdx = ln.Index();
+			Ask(q, 1);
+		}
+	}
+
+	void OpenDoor(PlayerPawn pmo, Line ln)
+	{
+		if (!ln) return;
+		bool hb = pmo.CountInv("BlueCard") > 0;
+		bool hy = pmo.CountInv("YellowCard") > 0;
+		bool hr = pmo.CountInv("RedCard") > 0;
+		pmo.A_GiveInventory("BlueCard", 1);
+		pmo.A_GiveInventory("YellowCard", 1);
+		pmo.A_GiveInventory("RedCard", 1);
+		bypass = true;
+		ln.Activate(pmo, 0, SPAC_Use);
+		bypass = false;
+		if (!hb) pmo.A_TakeInventory("BlueCard");
+		if (!hy) pmo.A_TakeInventory("YellowCard");
+		if (!hr) pmo.A_TakeInventory("RedCard");
+	}
+
+	// ---------- solo 4 armas y escasez de munición y salud ----------
+	// Armas permitidas: pistola, escopeta, superescopeta y (en Brutal Doom) el rifle. El puño se queda.
+	static bool AllowedWeaponName(Name n)
+	{
+		static const Name ok[] = {
+			'Fist', 'Pistol', 'Shotgun', 'SuperShotgun',                          // DOOM normal
+			'Melee_Attacks', 'BrutalPistol', 'DualPistols', 'PuristPistol',       // Brutal Doom
+			'Shot_Gun', 'PuristShot_Gun', 'SSG', 'PuristSSG',
+			'Rifle', 'DualRifles', 'PuristRifle',
+			'PistolSpawner', 'ShotgunSpawner', 'SSGSpawner', 'RifleSpawner'       // sus armas del suelo
+		};
+		for (int i = 0; i < ok.Size(); i++) if (ok[i] == n) return true;
+		return false;
+	}
+
+	// Armas que se quitan del inventario si llegan a tenerse (Brutal Doom da algunas al empezar)
+	static const Name banned[] = {
+		'Chainsaw', 'Chaingun', 'RocketLauncher', 'PlasmaRifle', 'BFG9000',
+		'BrutalAxe', 'Chain_Saw', 'BrutalSMG', 'DualSMG', 'PuristSMG', 'MP40', 'DualMP40', 'PuristMP40',
+		'Revolver', 'PuristRevolver', 'AssaultShotgun', 'PuristAssaultShotgun', 'Sniper', 'PuristSniper',
+		'MiniGun', 'PuristMiniGun', 'MG42', 'PuristMG42', 'IncendiaryLauncher', 'PuristIncendiaryLauncher',
+		'GrenadeLauncher', 'PuristGrenadeLauncher', 'Rocket_Launcher', 'PuristRocket_Launcher',
+		'Devastator', 'PuristDevastator', 'Plasma_Gun', 'DUalPlasmaRifles', 'PuristPlasma_Gun',
+		'RailGun', 'PuristRailGun', 'NukeLauncher', 'PuristNukeLauncher', 'BFG10k', 'PuristBFG10k',
+		'BIG_FUCKING_GUN', 'PuristBIG_FUCKING_GUN', 'HellishMissileLauncher', 'PuristHellishMissileLauncher',
+		'Unmaker', 'PuristUnmaker', 'FlameCannon', 'DualFlameCannon', 'PuristFlameCannon',
+		'Flamethrower2', 'PuristFlamethrower2', 'HandGrenades', 'PuristHandGrenades', 'GrenadeAmmo'
+	};
+
+	void EnforceWeapons(PlayerPawn pmo)
+	{
+		bool lost = false;
+		for (int i = 0; i < banned.Size(); i++)
+		{
+			class<Actor> c = banned[i];
+			if (!c) continue;                         // esa clase no existe en este juego
+			let inv = pmo.FindInventory((class<Inventory>)(c));
+			if (!inv) continue;
+			if (pmo.player.ReadyWeapon == inv || pmo.player.PendingWeapon == inv) lost = true;
+			pmo.RemoveInventory(inv);
+			inv.Destroy();
+		}
+		if (lost)
+		{
+			let w = SSGClass(pmo);
+			if (w && pmo.FindInventory(w)) pmo.A_SelectWeapon(w);
+			else pmo.PickNewWeapon(null);
+		}
+	}
+
+	// Brutal Doom empieza solo con el rifle: también la pistola
+	static void GiveBDPistol(PlayerPawn pmo)
+	{
+		if (!pmo) return;
+		String bn = "BrutalPistol";
+		class<Actor> bc = bn;
+		class<Inventory> bp = (class<Inventory>)(bc);
+		String dn = "DualPistols";
+		class<Actor> dc = dn;
+		class<Inventory> dp = (class<Inventory>)(dc);
+		if (bp && !pmo.FindInventory(bp) && !(dp && pmo.FindInventory(dp))) pmo.A_GiveInventory(bp, 1);
+	}
+
+	// ¿Esta munición la usa alguna de las 4 armas?
+	static bool AllowedAmmo(class<Ammo> a)
+	{
+		static const Name ws[] = { 'Pistol', 'Shotgun', 'SuperShotgun', 'BrutalPistol', 'DualPistols', 'Shot_Gun', 'SSG', 'Rifle', 'DualRifles' };
+		for (int i = 0; i < ws.Size(); i++)
+		{
+			class<Actor> c = ws[i];
+			class<Weapon> w = (class<Weapon>)(c);
+			if (!w) continue;
+			let d = GetDefaultByType(w);
+			if (d.AmmoType1 == a || d.AmmoType2 == a) return true;
+		}
+		return false;
+	}
+
+	void QueueScarce(Actor a, bool late)
+	{
+		let inv = Inventory(a);
+		if (!inv || inv.Owner) return;
+		if (scarceItem.Find(inv) != scarceItem.Size() || scarceDone.Find(inv) != scarceDone.Size()) return;
+		scarceItem.Push(inv);
+		scarceTic.Push(level.maptime);
+		scarceLate.Push(late);
+	}
+
+	override void WorldThingSpawned(WorldEvent e)
+	{
+		// lo que aparece después (spawners de Brutal Doom, lo que sueltan los enemigos)
+		if (mapReady && !deathmatch && e.Thing is "Inventory") QueueScarce(e.Thing, level.maptime > 35);
+	}
+
+	// Qué se hace con un objeto del suelo: 0 se queda, 1 se tira a suertes, 2 se quita, 3 se cambia por el rifle
+	int ScarceRule(Inventory inv, bool late)
+	{
+		if (inv is "GCLibro" || inv is "GCTomo" || inv is "Key") return 0;
+		if (InheritsFrom(inv, 'BasicWeaponPickup')) return 0;        // spawners invisibles de Brutal Doom
+		if (IsWeaponPickup(inv))
+		{
+			// Brutal Doom: en el sitio de la ametralladora (y de las otras armas de balas) aparece el rifle
+			if (InheritsFrom(inv, 'ChaingunSpawner') || InheritsFrom(inv, 'SMGSpawner') || InheritsFrom(inv, 'MP40Spawner') || InheritsFrom(inv, 'MG42Spawner'))
+				return 3;
+			if (!AllowedWeaponName(inv.GetClassName())) return 2;    // armas que no son de las 4
+			return late ? 1 : 0;                                      // las del mapa se quedan; las que sueltan los enemigos, a suertes
+		}
+		if (inv is "BackpackItem") return 1;
+		if (inv is "Ammo")
+		{
+			class<Ammo> pa = Ammo(inv).GetParentAmmo();
+			return AllowedAmmo(pa) ? 1 : 2;                         // cohetes, celdas, granadas...: fuera
+		}
+		if (inv.GetClassName() == 'Clip1Drop') return 1;              // cargador que sueltan en Brutal Doom
+		if (inv is "Health" && inv.Amount < 100) return 1;            // botiquines y bonus (las esferas se quedan)
+		return 0;
+	}
+
+	void ScarceTick()
+	{
+		if (difficulty < 0) return;                                    // hasta que se elija la dificultad
+		int keep = (difficulty == 0) ? 33 : 10;                        // fácil: un tercio; normal y ultra: casi nada
+		for (int i = scarceItem.Size() - 1; i >= 0; i--)
+		{
+			let inv = Inventory(scarceItem[i]);
+			if (inv && level.maptime - scarceTic[i] < 1) continue;   // un tic: por si era para dárselo a alguien
+			bool late = scarceLate[i];
+			scarceItem.Delete(i); scarceTic.Delete(i); scarceLate.Delete(i);
+			if (!inv || inv.Owner) continue;
+			int r = ScarceRule(inv, late);
+			bool gone = r == 2 || (r == 1 && random[GCQ](1, 100) > keep) || (r == 3 && late && random[GCQ](1, 100) > keep);
+			if (r == 3 && !gone)
+			{
+				String rn = "RifleSpawner";                // solo existe con Brutal Doom
+				class<Actor> rc = rn;
+				Actor rf = rc ? Actor.Spawn(rc, inv.pos, NO_REPLACE) : null;
+				if (rf)
+				{
+					rf.angle = inv.angle;
+					scarceDone.Push(rf);                   // ya decidido: no se vuelve a sortear
+					int qi = scarceItem.Find(rf);
+					if (qi != scarceItem.Size()) { scarceItem.Delete(qi); scarceTic.Delete(qi); scarceLate.Delete(qi); if (qi < i) i--; }
+				}
+				gone = true;
+			}
+			if (gone)
+			{
+				int li = locked.Find(inv);
+				if (li != locked.Size()) locked.Delete(li);
+				inv.Destroy();
+			}
+		}
+	}
+
+	// Inventario recién dado (partida nueva o reinicio tras morir): se nota porque no tiene la marca del mod.
+	// Al pasar de nivel el inventario se conserva con la marca y la munición no se toca.
+	void MarkFreshStart(int pn)
+	{
+		let pmo = players[pn].mo;
+		if (!pmo) return;
+		if (pmo.FindInventory("GCStartToken")) return;
+		pmo.A_GiveInventory("GCStartToken", 1);
+		P(pn).trimPending = true;
+	}
+
+	// Brutal Doom tiene scripts que, al empezar cada nivel, dan 10 balas al jugador por cada caja de cohetes
+	// (y otras cosas) del mapa. Durante el primer segundo la munición de reserva no puede subir.
+	static const Name resAmmo[] = { 'Clip', 'Shell', 'Clip1', 'Clip2', 'AmmoShell' };
+
+	void SnapAmmo(GCPlayerState q, PlayerPawn pmo)
+	{
+		if (!q || !pmo) return;
+		q.snapAmt.Clear();
+		for (int i = 0; i < resAmmo.Size(); i++)
+		{
+			class<Actor> c = resAmmo[i];
+			q.snapAmt.Push(c ? pmo.CountInv((class<Inventory>)(c)) : -1);
+		}
+		q.snapValid = true;
+	}
+
+	void ClampAmmo(GCPlayerState q, PlayerPawn pmo)
+	{
+		for (int i = 0; i < resAmmo.Size() && i < q.snapAmt.Size(); i++)
+		{
+			if (q.snapAmt[i] < 0) continue;
+			class<Actor> c = resAmmo[i];
+			let inv = pmo.FindInventory((class<Inventory>)(c));
+			if (inv && inv.Amount > q.snapAmt[i]) inv.Amount = q.snapAmt[i];
+		}
+	}
+
+	// Munición inicial justa: balas y cartuchos por tipo, contando lo que ya va en el cargador (Brutal Doom)
+	void TrimStartAmmo(PlayerPawn pmo)
+	{
+		int bullets = (difficulty == 0) ? 20 : 8;
+		int shells = (difficulty == 0) ? 8 : 4;
+		Array<String> resNames;
+		Array<int> resBudget, resInMag;
+		for (let it = pmo.Inv; it; it = it.Inv)
+		{
+			let w = Weapon(it);
+			if (!w || !AllowedWeaponName(w.GetClassName()) || !w.AmmoType1) continue;
+			String rn = w.AmmoType1.GetClassName();
+			int budget = (rn.MakeLower().IndexOf("shell") >= 0) ? shells : bullets;
+			int k = resNames.Find(rn);
+			if (k == resNames.Size()) { resNames.Push(rn); resBudget.Push(budget); resInMag.Push(0); }
+			// cargador del arma (Brutal Doom): como mucho lo que toca, y cuenta para el total
+			if (w.AmmoType2 && w.AmmoType2 != w.AmmoType1)
+			{
+				let mag = pmo.FindInventory(w.AmmoType2);
+				if (mag)
+				{
+					mag.Amount = clamp(mag.Amount, 0, budget);
+					resInMag[k] = max(resInMag[k], mag.Amount);
+				}
+			}
+		}
+		for (int k = 0; k < resNames.Size(); k++)
+		{
+			class<Actor> rc = resNames[k];
+			let res = pmo.FindInventory((class<Inventory>)(rc));
+			int want = max(0, resBudget[k] - resInMag[k]);
+			if (res) res.Amount = want;
+			else if (want > 0) pmo.A_GiveInventory((class<Inventory>)(rc), want);
+		}
+	}
+
+	void GiveAmmo(PlayerPawn pmo)
+	{
+		class<Inventory> at = "Clip";
+		let w = pmo.player.ReadyWeapon;
+		if (w && w.AmmoType1) at = w.AmmoType1;     // en Brutal Doom, AmmoType1 es la reserva
+		else if (w && w.AmmoType2) at = w.AmmoType2;
+		else
+		{
+			// con el puño: cartuchos (los de la superescopeta, de DOOM normal o de Brutal Doom)
+			String bn = "SSG";
+			class<Actor> bc = bn;
+			class<Weapon> sw = (class<Weapon>)(bc);
+			if (!sw) sw = "SuperShotgun";
+			if (GetDefaultByType(sw).AmmoType1) at = GetDefaultByType(sw).AmmoType1;
+		}
+		int n = GetDefaultByType(at).Amount;
+		if (n < 1) n = 1;
+		if (n < 10 && GetDefaultByType(at).MaxAmount >= 100) n = 10;
+		pmo.A_GiveInventory(at, n);
+	}
+
+	// Lo que aprende el jugador con cada respuesta: libro de repaso, dominio de la pregunta y resumen del nivel
+	void Study(GCPlayerState q, bool ok)
+	{
+		int idx = q.curIdx;
+		if (idx < 0 || idx >= bank.Size()) return;
+		if (q.due.Size() < bank.Size()) q.due.Resize(bank.Size());
+		int fi = q.failedIdx.Find(idx);
+		bool inBook = fi != q.failedIdx.Size();
+		int b = bankBlock[idx];
+		q.lvAsked++;
+		if (ok)
+		{
+			Promote(q, idx);
+			if (inBook)
+			{
+				// En fácil hay que acertarla dos veces seguidas; la segunda, un rato después
+				q.failNeed[fi]--;
+				if (difficulty != 0 || q.failNeed[fi] <= 0)
+				{
+					q.failedIdx.Delete(fi); q.failNeed.Delete(fi); q.failDue.Delete(fi);
+				}
+				else q.failDue[fi] = q.qCount + random[GCQ](6, 10);
+			}
+			if (b >= 0 && b < q.lvHit.Size()) q.lvHit[b]++;
+		}
+		else
+		{
+			q.mastery[idx] = 0;
+			q.due[idx] = (q.today > 0) ? q.today + 1 : 1;   // mañana vuelve (y hoy, en el libro)
+			int due = q.qCount + random[GCQ](3, 4);
+			if (!inBook) { q.failedIdx.Push(idx); q.failNeed.Push(2); q.failDue.Push(due); }   // al libro
+			else { q.failNeed[fi] = 2; q.failDue[fi] = due; }
+			if (b >= 0 && b < q.lvMiss.Size()) q.lvMiss[b]++;
+			if (q.lvFailed.Find(idx) == q.lvFailed.Size()) q.lvFailed.Push(idx);
+		}
+		q.progSerial++;
+	}
+
+	void Resolve(int pl, bool ok)
+	{
+		let q = P(pl);
+		let pmo = players[pl].mo;
+		if (!q) return;
+		if (q.kind == 5) { ResolveDM(q, ok); return; }     // PvP: pregunta para reaparecer (estás muerto)
+		if (!pmo || pmo.health <= 0) { ClearQuestion(q); return; }
+		Study(q, ok);
+		if (deathmatch && dmOverTic == 0) { if (ok) q.dmHits++; else q.dmMiss++; }   // PvP: también las de coger objetos
+		if (ok)
+		{
+			q.hits++;
+			q.score += 50;
+			if (q.golden)
+			{
+				// Pregunta dorada: premio sorpresa (se descubre al acertar)
+				q.score += 150;
+				pmo.GiveBody(25);
+				GiveAmmo(pmo);
+				GiveAmmo(pmo);
+				if (difficulty == 2) q.qLives = min(q.qLives + 1, 3);
+				q.golden = false;
+			}
+			if (q.kind == 4)
+			{
+				pmo.GiveBody(10);       // pregunta voluntaria: +10 de vida (hasta 100) y munición
+				GiveAmmo(pmo);
+			}
+			else if (q.kind == 1)
+			{
+				if (q.doorIdx >= 0 && q.doorIdx < level.Lines.Size())
+				{
+					q.solved.Push(q.doorIdx);
+					OpenDoor(pmo, level.Lines[q.doorIdx]);
+				}
+			}
+			else if (q.kind == 3 && q.hard && ++q.keyStreak < LLAVE_RACHA)
+			{
+				// llave: bien, pero hacen falta 3 seguidas: la siguiente difícil
+				NextQuestion(q);
+				q.askSerial++;
+				return;
+			}
+			else if (q.kind == 3) TakeItem(q, pmo, true);
+			else
+			{
+				GiveAmmo(pmo);
+				pmo.A_TakeInventory("GCInstaKill");
+				pmo.A_GiveInventory("GCInstaKill", 1);   // el siguiente disparo mata de un golpe
+			}
+			ClearQuestion(q);
+		}
+		else
+		{
+			q.misses++;
+			if (q.kind == 4) { ClearQuestion(q); return; }      // pregunta voluntaria: fallar no cuesta nada
+			if (difficulty == 2 && --q.qLives <= 0) { QuizDeath(q, pmo); return; }
+			if (q.kind == 3) { TakeItem(q, pmo, false); return; }
+			if (difficulty != 0)                 // en fácil fallar no quita vida
+				pmo.DamageMobj(null, null, 10, 'None', DMG_NO_ARMOR | DMG_THRUSTLESS);
+			if (pmo.health > 0) { NextQuestion(q); q.askSerial++; }
+			else ClearQuestion(q);
+		}
+	}
+
+	// ---------- PvP (deathmatch) ----------
+	// Al morir sale una pregunta: acierto = reapareces ya con armadura (dorada: megaesfera);
+	// fallo o salir sin contestar = reapareces a los 5 segundos.
+	// Puntos de la ronda: matar +3, acertar +3, fallar -1 (como en el examen, cada fallo resta un tercio de acierto).
+	const DM_MATAR = 3;
+	const DM_ACIERTO = 3;
+	const DM_FALLO = 1;
+	const DM_PREGUNTA_TRAS = 25;        // tics muerto antes de que salga la pregunta
+	const DM_ESPERA_FALLO = 35 * 5;
+	const DM_RESULTADOS = 35 * 10;      // pantalla de resultados al acabar la ronda (luego, 2 s del recuento del juego)
+
+	clearscope static int FragsOf(int pn)
+	{
+		int n = 0;
+		for (int j = 0; j < MAXPLAYERS; j++) if (j != pn) n += players[pn].frags[j];
+		return n;
+	}
+
+	clearscope static int DMPoints(GCPlayerState q)
+	{
+		return q ? q.dmKills * DM_MATAR + q.dmHits * DM_ACIERTO - q.dmMiss * DM_FALLO : 0;
+	}
+
+	// Jugadores ordenados por puntos (empate: más muertes, luego más aciertos)
+	clearscope void DMRanking(out Array<int> r)
+	{
+		r.Clear();
+		for (int i = 0; i < MAXPLAYERS; i++) if (playeringame[i] && i < ps.Size() && ps[i]) r.Push(i);
+		for (int a = 1; a < r.Size(); a++)
+		{
+			int v = r[a], b = a - 1;
+			while (b >= 0 && DMBetter(ps[v], ps[r[b]])) { r[b + 1] = r[b]; b--; }
+			r[b + 1] = v;
+		}
+	}
+
+	clearscope static bool DMBetter(GCPlayerState x, GCPlayerState y)
+	{
+		int px = DMPoints(x), py = DMPoints(y);
+		if (px != py) return px > py;
+		if (x.dmKills != y.dmKills) return x.dmKills > y.dmKills;
+		return x.dmHits > y.dmHits;
+	}
+
+	static String DMNextMap(String cur)
+	{
+		static const Name mapas[] = { 'BDM05', 'BDM07', 'BDM10', 'BDM12' };   // los 4 mapas PvP
+		Array<String> pool;
+		for (int i = 0; i < mapas.Size(); i++)
+		{
+			String m = mapas[i];
+			if (LevelInfo.MapExists(m) && !(m ~== cur)) pool.Push(m);
+		}
+		if (pool.Size() == 0) return cur;
+		return pool[random[GCMap](0, pool.Size() - 1)];
+	}
+
+	void ResolveDM(GCPlayerState q, bool ok)
+	{
+		Study(q, ok);                                  // cuenta para el repaso por días como cualquier pregunta
+		bool counts = dmOverTic == 0;                  // tras acabar la ronda ya no suma
+		if (ok)
+		{
+			q.hits++;
+			if (counts) q.dmHits++;
+			q.dmBonus = q.golden ? 2 : 1;
+			q.dmWait = 0;
+		}
+		else
+		{
+			q.misses++;
+			if (counts) q.dmMiss++;
+			q.dmBonus = 0;
+			q.dmWait = DM_ESPERA_FALLO;
+		}
+		q.golden = false;
+		q.dmSkipped = false;
+		ClearQuestion(q);
+	}
+
+	void DMRespawnBonus(int pn)
+	{
+		let q = P(pn);
+		let pmo = players[pn].mo;
+		if (!q || !pmo) return;
+		if (q.dmBonus == 2) pmo.A_GiveInventory("Megasphere", 1);       // 200 de vida y 200 de armadura
+		else if (q.dmBonus == 1) pmo.A_GiveInventory("GreenArmor", 1);  // 100 de armadura
+		q.dmBonus = 0;
+	}
+
+	void DMReborn(int i)
+	{
+		players[i].cls = null;
+		players[i].playerstate = PST_REBORN;
+	}
+
+	void DMTick()
+	{
+		// marcador: las muertes las cuenta el propio juego
+		if (dmOverTic == 0)
+			for (int i = 0; i < MAXPLAYERS; i++)
+				if (playeringame[i]) P(i).dmKills = max(0, FragsOf(i) - P(i).dmFragBase);
+		if (dmChanging) return;
+		if (dmEndTic <= 0)
+		{
+			let cv = CVar.FindCVar("gcq_pvp_segundos");
+			int secs = cv ? cv.GetInt() : 600;
+			dmEndTic = level.maptime + max(30, secs) * 35;
+		}
+		if (dmOverTic == 0 && level.maptime >= dmEndTic) DMEndRound();
+		if (dmOverTic > 0)
+		{
+			if (level.maptime - dmOverTic >= DM_RESULTADOS)
+			{
+				dmChanging = true;
+				level.ChangeLevel(dmNext, 0, CHANGELEVEL_NOINTERMISSION | CHANGELEVEL_RESETINVENTORY | CHANGELEVEL_RESETHEALTH);
+			}
+			return;
+		}
+		DMLockTick();
+		for (int i = 0; i < MAXPLAYERS; i++)
+		{
+			if (!playeringame[i] || !players[i].mo) continue;
+			let q = P(i);
+			let pmo = players[i].mo;
+			DMDeathTick(i, q, pmo);
+			if (players[i].playerstate == PST_LIVE && pmo.health > 0) DMPlayerTick(i, q, pmo);
+			else { q.promptVisible = false; q.doorPrompt = false; }
+		}
+	}
+
+	// Inicio de cada vida en PvP, como en el modo normal: pistola y superescopeta, y munición justa (al poco de aparecer)
+	void DMStart(int pn)
+	{
+		let pmo = players[pn].mo;
+		if (!pmo) return;
+		GiveBDPistol(pmo);
+		GiveSSG(pmo);
+		P(pn).ssgTics = 35;
+		MarkFreshStart(pn);
+		SnapAmmo(P(pn), pmo);
+	}
+
+	// Los objetos que vuelven a aparecer (munición y salud) siguen bloqueados: no se cogen al pisarlos
+	void DMLockTick()
+	{
+		for (int k = locked.Size() - 1; k >= 0; k--)
+		{
+			let it = locked[k];
+			if (!it || it.Owner) { locked.Delete(k); continue; }
+			if (it.bSPECIAL) it.bSPECIAL = false;
+		}
+	}
+
+	void DMPlayerTick(int i, GCPlayerState q, PlayerPawn pmo)
+	{
+		if (q.cooldown > 0) q.cooldown--;
+		if (q.snapValid)
+		{
+			if (level.maptime <= 35) ClampAmmo(q, pmo);
+			else q.snapValid = false;
+		}
+		if (players[i].bot)
+		{
+			// los bots no pueden contestar para coger munición: tienen la suya y se les rellena cada 10 segundos
+			q.trimPending = false;
+			if (level.maptime % 350 == 0) { GiveAmmo(pmo); GiveAmmo(pmo); }
+		}
+		// munición inicial escasa (después de lo que da Brutal Doom en el primer segundo)
+		if (q.trimPending && difficulty >= 0 && level.maptime >= 40)
+		{
+			q.trimPending = false;
+			TrimStartAmmo(pmo);
+		}
+		if (q.ssgTics > 0)
+		{
+			q.ssgTics--;
+			let w = SSGClass(pmo);
+			let have = Weapon(pmo.FindInventory(w));
+			if (!have) GiveSSG(pmo);
+			else if (pmo.player.ReadyWeapon != have && pmo.player.PendingWeapon != have) pmo.A_SelectWeapon(w);
+		}
+		q.hasTomo = pmo.CountInv("GCTomo") > 0;
+		LockNearby(pmo);                 // lo que aparece cerca (armas de Brutal Doom...) también se bloquea
+		if (q.kind != 0) { q.promptVisible = false; q.doorPrompt = false; return; }
+		CheckItems(q, pmo);
+		q.doorPrompt = false;
+	}
+
+	void DMDeathTick(int i, GCPlayerState q, PlayerPawn pmo)
+	{
+		if (players[i].playerstate != PST_DEAD)
+		{
+			if (pmo.health > 0) q.deadTics = -1;
+			return;
+		}
+		if (q.deadTics < 0)
+		{
+			q.deadTics = 0;
+			ClearQuestion(q);
+			q.dmAsked = false; q.dmWait = 0; q.dmBonus = 0; q.dmSkipped = false;
+		}
+		q.deadTics++;
+		// bots (o banco vacío): reaparecen solos a los 3 segundos
+		if (players[i].bot || bank.Size() == 0)
+		{
+			if (q.deadTics >= RESPAWN_TICS) DMReborn(i);
+			return;
+		}
+		if (!q.dmAsked)
+		{
+			if (q.deadTics >= DM_PREGUNTA_TRAS) { q.dmAsked = true; Ask(q, 5); }
+			return;
+		}
+		if (q.kind == 5) return;                 // contestando
+		if (q.dmWait > 0) { q.dmWait--; return; }
+		DMReborn(i);
+	}
+
+	void DMEndRound()
+	{
+		dmOverTic = level.maptime;
+		dmNext = DMNextMap(level.MapName);
+		Array<int> r;
+		DMRanking(r);
+		for (int i = 0; i < MAXPLAYERS; i++)
+		{
+			if (!playeringame[i]) continue;
+			ClearQuestion(P(i));
+			players[i].cheats |= CF_TOTALLYFROZEN;   // quietos mientras se ven los resultados
+		}
+		if (r.Size() > 0) Console.Printf("Fin de la ronda: gana %s con %d puntos", players[r[0]].GetUserName(), DMPoints(ps[r[0]]));
+	}
+
+	// Ultrapesadilla: sin vidas de pregunta mueres.
+	// En solitario empiezas de nuevo en otro mapa; en cooperativo reapareces.
+	void QuizDeath(GCPlayerState q, PlayerPawn pmo)
+	{
+		q.qLives = 0;
+		ClearQuestion(q);
+		pmo.DamageMobj(null, null, Actor.TELEFRAG_DAMAGE, 'None', DMG_FORCED | DMG_NO_ARMOR | DMG_THRUSTLESS);
+	}
+
+	void TakeItem(GCPlayerState q, PlayerPawn pmo, bool ok)
+	{
+		let it = q.pendingItem;
+		ClearQuestion(q);
+		if (!it || it.Owner) return;
+		if (ok)
+		{
+			GiveByTouch(it, pmo);
+			if (it && !it.Owner && !deathmatch) q.unlocked.Push(it);   // se quedó en el suelo para los demás (cooperativo)
+		}
+		// Si fallas, el objeto sigue ahí bloqueado: pulsa E otra vez para otra pregunta
+	}
+
+	// ---------- progreso guardado entre partidas ----------
+	// Formato "2": por cada pregunta con algo que recordar, 14 cifras hex de su clave + caja (0-5)
+	// + aciertos que faltan para sacarla del libro (0-2) + día en que le toca (4 cifras hex; 0000 = nunca).
+	// El formato "1" antiguo ('a' + dominio * 3 + libro) se sigue leyendo: lo sabido pasa a tocar hoy.
+	clearscope String SaveProgress(GCPlayerState q)
+	{
+		String s = "2" .. q.progForeign;
+		for (int i = 0; i < bank.Size() && i < q.mastery.Size() && i < q.due.Size(); i++)
+		{
+			int m = clamp(q.mastery[i], 0, 5);
+			int need = 0;
+			int fi = q.failedIdx.Find(i);
+			if (fi != q.failedIdx.Size()) need = clamp(q.failNeed[fi], 1, 2);
+			int d = clamp(q.due[i], 0, 0xFFFF);
+			if (m <= 0 && need <= 0 && d <= 0) continue;
+			s.AppendFormat("%s%d%d%04x", bankKey[i], m, need, d);
+		}
+		return s;
+	}
+
+	clearscope static int HexVal(String h)
+	{
+		int v = 0;
+		for (int i = 0; i < h.Length(); i++)
+		{
+			int c = h.ByteAt(i), x;
+			if (c >= 0x30 && c <= 0x39) x = c - 0x30;
+			else if (c >= 0x61 && c <= 0x66) x = c - 0x61 + 10;
+			else if (c >= 0x41 && c <= 0x46) x = c - 0x41 + 10;
+			else return -1;
+			v = v * 16 + x;
+		}
+		return v;
+	}
+
+	int KeyIndex(String key)
+	{
+		int idx = bankKey.Find(key);
+		if (idx != bankKey.Size()) return idx;
+		int j = oldKey.Find(key);              // versión anterior de la pregunta
+		if (j < oldKey.Size() && j < bank.Size()) return j;
+		return -1;                             // pregunta que ya no está en el banco
+	}
+
+	void LoadProgress(GCPlayerState q, String s)
+	{
+		if (q.mastery.Size() < bank.Size()) q.mastery.Resize(bank.Size());
+		if (q.due.Size() < bank.Size()) q.due.Resize(bank.Size());
+		String v = s.Left(1);
+		int step = (v == "2") ? 20 : (v == "1") ? 15 : 0;
+		if (step == 0) return;
+		int n = 0;
+		for (int at = 1; at + step <= s.Length(); at += step)
+		{
+			int idx = KeyIndex(s.Mid(at, 14));
+			if (idx < 0)
+			{
+				if (v == "2" && q.progForeign.IndexOf(s.Mid(at, 14)) < 0) q.progForeign.AppendFormat("%s", s.Mid(at, step));
+				continue;
+			}
+			int m, need, d;
+			if (v == "2")
+			{
+				m = s.ByteAt(at + 14) - 0x30;
+				need = s.ByteAt(at + 15) - 0x30;
+				d = HexVal(s.Mid(at + 16, 4));
+				if (m < 0 || m > 5 || need < 0 || need > 2 || d < 0) continue;
+			}
+			else
+			{
+				int c = s.ByteAt(at + 14) - 0x61;
+				if (c < 0 || c > 11) continue;
+				m = min(c / 3, 2);                   // lo dominado antes aún no cuenta como 3 días distintos
+				need = c % 3;
+				d = (m > 0 || need > 0) ? max(q.today, 1) : 0;   // todo lo sabido toca repasarlo hoy
+				if (need > 0) m = 0;
+			}
+			if (q.mastery[idx] < m) q.mastery[idx] = m;
+			if (d > 0 && (q.due[idx] == 0 || d < q.due[idx])) q.due[idx] = d;
+			if (need > 0 && q.failedIdx.Find(idx) == q.failedIdx.Size())
+			{
+				q.failedIdx.Push(idx);
+				q.failNeed.Push(need);
+				q.failDue.Push(q.qCount + 1 + n * 2);   // lo pendiente de la última vez sale pronto, intercalado
+				n++;
+			}
+		}
+		q.progSerial++;                              // se vuelve a guardar ya en el formato nuevo
+	}
+
+	override void NetworkProcess(ConsoleEvent e)
+	{
+		let q = P(e.Player);
+		if (!q) return;
+		if (e.Name == "gcq_diff")
+		{
+			if (multiplayer && e.Player != Net_Arbitrator) return;   // en cooperativo decide el anfitrión
+			difficulty = clamp(e.Args[0], 0, 2);
+			for (int i = 0; i < ps.Size(); i++) if (ps[i]) ps[i].qLives = 3;
+			Console.Printf("Dificultad: %s", difficulty == 0 ? "FACIL" : difficulty == 1 ? "NORMAL" : "ULTRAPESADILLA");
+			return;
+		}
+		if (e.Name == "gcq_use")
+		{
+			let pmo = players[e.Player].mo;
+			if (pmo && pmo.health <= 0)
+			{
+				if (deathmatch) return;                         // PvP: se reaparece contestando la pregunta
+				if (q.deadTics >= 20) q.wantRespawn = true;   // no al instante, por si ibas a pulsarla al morir
+				return;
+			}
+			if (q.kind != 0 || q.cooldown > 0 || !pmo || pmo.health <= 0) return;
+			if (q.bookItem && !q.bookItem.Owner)
+			{
+				GiveByTouch(q.bookItem, pmo);
+				q.bookItem = null;
+				return;
+			}
+			if (q.tomoItem && !q.tomoItem.Owner)
+			{
+				GiveByTouch(q.tomoItem, pmo);
+				q.tomoItem = null;
+				return;
+			}
+			if (q.promptItem && !q.promptItem.Owner)
+			{
+				q.pendingItem = q.promptItem;
+				q.itemType = GetItemType(q.promptItem);
+				q.promptVisible = false;
+				q.hard = q.itemType == 2;        // llave: 3 preguntas difíciles seguidas
+				q.keyStreak = 0;
+				q.keyUsed.Clear();
+				Ask(q, 3);
+				return;
+			}
+			// Sin objeto cerca: la E abre puertas y pulsa interruptores (las puertas preguntan)
+			Line ln; int side;
+			[ln, side] = LineInFront(pmo);
+			if (ln) ln.Activate(pmo, side, SPAC_Use);
+		}
+		else if (e.Name == "gcq_guia")
+		{
+			if (deathmatch) return;                              // PvP: sin guía
+			q.guia = !q.guia;
+			let pmo = players[e.Player].mo;
+			if (q.guia && nav && pmo && pmo.health > 0)
+			{
+				nav.Plan(q, pmo);
+				nav.Visibility(q, pmo);
+				q.gTic = level.maptime;
+			}
+		}
+		else if (e.Name == "gcq_vol")
+		{
+			// Pregunta voluntaria de repaso (P): solo en fácil
+			let pmo = players[e.Player].mo;
+			if (!pmo || pmo.health <= 0) return;
+			if (deathmatch) { pmo.A_Print("En PvP las preguntas salen al morir"); return; }
+			if (difficulty != 0) { pmo.A_Print("La pregunta voluntaria (P) solo esta en modo FACIL"); return; }
+			if (q.kind == 0 && q.cooldown <= 0) Ask(q, 4);
+		}
+		else if (e.Name == "gcq_dia") { q.today = e.Args[0]; }
+		else if (e.Name == "gcq_pb") { q.progBuf = ""; }
+		else if (e.Name.Left(7) == "gcq_pd:") { q.progBuf = q.progBuf .. e.Name.Mid(7); }
+		else if (e.Name == "gcq_pe")
+		{
+			if (!q.progLoaded) LoadProgress(q, q.progBuf);
+			q.progBuf = "";
+			q.progLoaded = true;
+		}
+		else if (e.Name == "gcq_fechas")
+		{
+			q.soloFechas = e.Args[0] != 0;
+		}
+		else if (e.Name == "gcq_tm")
+		{
+			// Temas elegidos: Args = trozo k, máscara de los bloques 30k..30k+29
+			int k = e.Args[0];
+			for (int j = 0; j < 30; j++)
+			{
+				int b = k * 30 + j;
+				if (b < q.temaOn.Size()) q.temaOn[b] = (e.Args[1] & (1 << j)) ? 1 : 0;
+			}
+			int on = 0;
+			for (int b = 0; b < q.temaOn.Size(); b++) on += q.temaOn[b];
+			if (on == 0) for (int b = 0; b < q.temaOn.Size(); b++) q.temaOn[b] = 1;   // ninguno = todos
+			q.temaFilter = on > 0 && on < q.temaOn.Size();
+		}
+		else if (e.Name == "gcq_reload")
+		{
+			let pmo = players[e.Player].mo;
+			if (deathmatch) return;                              // PvP: recargar no pregunta
+			if (q.kind == 0 && q.cooldown <= 0 && pmo && pmo.health > 0) Ask(q, 2);
+		}
+		else if (q.kind != 0 && e.Name == "gcq_answer")
+		{
+			Resolve(e.Player, e.Args[0] == q.correctIdx);
+		}
+		else if (q.kind != 0 && e.Name == "gcq_abort")
+		{
+			if (q.kind == 5) { q.dmWait = DM_ESPERA_FALLO; q.dmSkipped = true; q.golden = false; }   // PvP: sin contestar, a esperar
+			ClearQuestion(q);
+			q.cooldown = 35;
+		}
+		else if (e.Name == "gcq_stats")
+		{
+			for (int i = 0; i < MAXPLAYERS; i++)
+			{
+				if (!playeringame[i] || !ps[i]) continue;
+				Console.Printf("%s - PUNTOS: %d | ACIERTOS: %d | FALLOS: %d",
+					players[i].GetUserName(), ps[i].score, ps[i].hits, ps[i].misses);
+			}
+		}
+	}
+
+	// ---------- cada tic, para cada jugador ----------
+	override void WorldTick()
+	{
+		if (deathmatch) { DMTick(); return; }
+		ScarceTick();
+		if (bank.Size() == 0) return;
+		if (needTomo) { needTomo = false; SpawnTomo(); }
+		if (tomoHint > 0) tomoHint--;
+		bool spawnBooks = needBook;
+		needBook = false;
+		for (int i = 0; i < MAXPLAYERS; i++)
+		{
+			if (!playeringame[i]) continue;
+			let pmo = players[i].mo;
+			let q = P(i);
+			if (!pmo) continue;
+			if (DeathTick(i, q, pmo)) continue;
+			TickPlayer(i, q, pmo, spawnBooks);
+		}
+	}
+
+	// ---------- al morir ----------
+	// En el mod la E no es "usar", así que el juego nunca te dejaría reaparecer.
+	// En solitario: a los 3 segundos (o al pulsar E) empiezas de cero en otro mapa al azar,
+	// como al abrir el juego. En cooperativo: reapareces en el mismo mapa.
+	const RESPAWN_TICS = 35 * 3;
+
+	bool DeathTick(int i, GCPlayerState q, PlayerPawn pmo)
+	{
+		if (pmo.health > 0 && players[i].playerstate != PST_DEAD) { q.deadTics = -1; q.wantRespawn = false; return false; }
+		if (players[i].playerstate != PST_DEAD) return true;    // ya está reapareciendo
+		if (q.deadTics < 0) { q.deadTics = 0; ClearQuestion(q); }
+		q.promptVisible = false; q.doorPrompt = false;
+		q.deadTics++;
+		if (q.deadTics < RESPAWN_TICS && !q.wantRespawn) return true;
+		q.wantRespawn = false;
+		if (!multiplayer)
+		{
+			if (!restarting) RestartNewMap();
+		}
+		else
+		{
+			players[i].cls = null;
+			players[i].playerstate = PST_REBORN;
+		}
+		return true;
+	}
+
+	// Mapas en los que se puede empezar: episodios 1-4, mapas 1-7 (sin jefes ni secretos).
+	// Nunca el mismo en el que has muerto.
+	// Si mueres en un mapa de jefe (E?M8) se sigue en su mismo episodio: saltar a otro episodio desde
+	// ahí sacaría el texto del final del episodio (en los demás mapas lo quita motor/mapas.txt).
+	static String RandomMap(String cur)
+	{
+		Array<String> pool;
+		int onlyEp = 0;
+		if (cur.Length() == 4 && cur.Left(1) ~== "E" && cur.Mid(2, 1) ~== "M" && cur.Mid(3, 1) == "8")
+			onlyEp = cur.Mid(1, 1).ToInt();
+		for (int e = 1; e <= 4; e++)
+		{
+			if (onlyEp > 0 && e != onlyEp) continue;
+			for (int m = 1; m <= 7; m++)
+			{
+				String n = String.Format("E%dM%d", e, m);
+				if (LevelInfo.MapExists(n) && !(n ~== cur)) pool.Push(n);
+			}
+		}
+		if (pool.Size() == 0) return cur;    // otro juego (DOOM II...): se repite el mismo nivel
+		return pool[random[GCMap](0, pool.Size() - 1)];
+	}
+
+	// Partida nueva en otro mapa: inventario y salud de inicio, puntos a cero.
+	// El estudio (dominadas, libro de repaso, temas) y la dificultad se conservan, como al volver a abrir el juego.
+	void RestartNewMap()
+	{
+		restarting = true;
+		for (int i = 0; i < MAXPLAYERS; i++)
+		{
+			let q = ps[i];
+			if (!q) continue;
+			ClearQuestion(q);
+			q.score = 0; q.hits = 0; q.misses = 0;
+			q.qLives = 3;
+		}
+		String m = RandomMap(level.MapName);
+		Console.Printf("Has muerto: partida nueva en %s", m);
+		level.ChangeLevel(m, 0, CHANGELEVEL_NOINTERMISSION | CHANGELEVEL_RESETINVENTORY | CHANGELEVEL_RESETHEALTH);
+	}
+
+	void TickPlayer(int i, GCPlayerState q, PlayerPawn pmo, bool spawnBooks)
+	{
+		if (q.cooldown > 0) q.cooldown--;
+		// Guía activa: recalcula la ruta cada medio segundo
+		if (q.guia && q.gExplore && q.gLine >= 0 && q.rx.Size() >= 2)
+		{
+			// explorando: al llegar al interruptor/zona propuesto, se da por visto y se busca otro
+			int k = q.rx.Size() - 1;
+			if ((pmo.pos.xy - (q.rx[k], q.ry[k])).Length() < 64 && q.gVisited.Find(q.gLine) == q.gVisited.Size())
+			{
+				q.gVisited.Push(q.gLine);
+				q.gTic = level.maptime - 12;     // recalcular enseguida (tras pulsarlo)
+			}
+		}
+		if (q.guia && nav && pmo.health > 0 && level.maptime - q.gTic >= 18)
+		{
+			nav.Plan(q, pmo);
+			nav.Visibility(q, pmo);
+			q.gTic = level.maptime;
+		}
+		else if (q.guia && nav && pmo.health > 0 && level.maptime % 6 == 0 && q.rx.Size() > 1)
+			nav.Visibility(q, pmo);          // la visibilidad se refresca más a menudo (es barata)
+		q.instaReady = pmo.CountInv("GCInstaKill") > 0;
+		q.hasBook = pmo.CountInv("GCLibro") > 0;
+		if (level.maptime % 8 == 0) EnforceWeapons(pmo);
+		if (q.snapValid)
+		{
+			if (level.maptime <= 35) ClampAmmo(q, pmo);
+			else q.snapValid = false;
+		}
+		// partida nueva: munición inicial escasa (después de lo que da Brutal Doom en el primer segundo)
+		if (q.trimPending && difficulty >= 0 && level.maptime >= 40 && pmo.health > 0)
+		{
+			q.trimPending = false;
+			TrimStartAmmo(pmo);
+		}
+		if (q.ssgTics > 0 && pmo.health > 0)
+		{
+			// Brutal Doom a veces pone su arma inicial después: se vuelve a sacar la súper escopeta
+			q.ssgTics--;
+			let w = SSGClass(pmo);
+			let have = Weapon(pmo.FindInventory(w));
+			if (!have) GiveSSG(pmo);
+			else if (pmo.player.ReadyWeapon != have && pmo.player.PendingWeapon != have) pmo.A_SelectWeapon(w);
+		}
+		q.hasTomo = pmo.CountInv("GCTomo") > 0;
+		if (difficulty == 0 && !q.hasTomo && pmo.health > 0)
+		{
+			pmo.A_GiveInventory("GCTomo", 1);   // modo estudio: el temario desde el principio
+			q.hasTomo = pmo.CountInv("GCTomo") > 0;
+		}
+		if (spawnBooks && !q.hasBook) SpawnBook(pmo);
+		LockNearby(pmo);                 // siempre, para que nada se recoja sin pregunta
+		if (q.kind != 0 || pmo.health <= 0) { q.promptVisible = false; q.doorPrompt = false; return; }
+		CheckItems(q, pmo);
+		q.doorPrompt = false;
+		if (!q.promptVisible)
+		{
+			Line ln; int side;
+			[ln, side] = LineInFront(pmo);
+			q.doorPrompt = ln && IsDoor(ln.special);
+		}
+		// La pregunta de recarga solo sale cuando el jugador la pide con su tecla (gcq_reload),
+		// nunca sola al quedarse sin balas y disparar.
+	}
+
+	// +100 puntos al jugador que mata al monstruo
+	override void WorldThingDied(WorldEvent e)
+	{
+		if (!e.Thing || !e.Thing.bIsMonster || deathmatch) return;   // en PvP cuentan las muertes de jugadores (DMTick)
+		Actor k = e.Inflictor;
+		if (k && !k.player && k.target) k = k.target;     // proyectil: cuenta quien lo disparó
+		if (!k || !k.player) k = e.Thing.target;
+		if (!k || !k.player) return;
+		let q = P(k.PlayerNumber());
+		if (q) q.score += 100;
+	}
+
+	// ---------- interfaz (solo en tu ordenador) ----------
+	override void UiTick()
+	{
+		if (!tiempo) tiempo = GCTiempo.Load();
+		tiempo.Tick();
+		let q = Me();
+		if (q && q.askSerial != uiSeen)
+		{
+			uiSeen = q.askSerial;
+			if (q.kind != 0) Menu.SetMenu("GCQuizMenu");
+		}
+		if (q && gamestate == GS_LEVEL) StudyTick(q);
+		// Al empezar la partida: menú de dificultad (en cooperativo solo al anfitrión)
+		if (difficulty < 0 && !diffShown && gamestate == GS_LEVEL && !Menu.GetCurrentMenu()
+			&& (!multiplayer || consoleplayer == Net_Arbitrator))
+		{
+			diffShown = true;
+			Menu.SetMenu("GCDificultadMenu");
+		}
+		// PvP en solitario (sin red): después de la dificultad, menú para añadir bots y probar
+		if (deathmatch && !netgame && difficulty >= 0 && !botsShown && gamestate == GS_LEVEL && !Menu.GetCurrentMenu())
+		{
+			botsShown = true;
+			Menu.SetMenu("GCBotsMenu");
+		}
+	}
+
+	// Progreso guardado y temas elegidos (cvars de este ordenador), y menús del modo estudio
+	ui void StudyTick(GCPlayerState q)
+	{
+		// 0) el día de hoy (para el repaso por días); antes que el progreso, y otra vez si cambia de día
+		if (diaSent == 0 || ++diaCheck >= 35 * 10)
+		{
+			diaCheck = 0;
+			int hoy = HoyLocal();
+			if (hoy != diaSent) { diaSent = hoy; EventHandler.SendNetworkEvent("gcq_dia", hoy); }
+		}
+		// 1) al empezar: se manda al juego el progreso guardado, en trozos
+		if (!progSent)
+		{
+			if (progPos == 0)
+			{
+				let cv = CVar.FindCVar("gcq_progreso");
+				progOut = cv ? cv.GetString() : "";
+				EventHandler.SendNetworkEvent("gcq_pb");
+			}
+			for (int n = 0; n < 4 && progPos < progOut.Length(); n++)
+			{
+				EventHandler.SendNetworkEvent("gcq_pd:" .. progOut.Mid(progPos, 180));
+				progPos += 180;
+			}
+			if (progPos >= progOut.Length())
+			{
+				EventHandler.SendNetworkEvent("gcq_pe");
+				progSent = true;
+				progOut = "";
+			}
+			return;
+		}
+		// 2) cada vez que cambia algo, se guarda (GZDoom lo escribe en su .ini al salir)
+		if (q.progLoaded && q.progSerial != progSaved)
+		{
+			progSaved = q.progSerial;
+			let cv = CVar.FindCVar("gcq_progreso");
+			if (cv) cv.SetString(SaveProgress(q));
+		}
+		// 3) temas guardados de la última vez
+		if (!temasSent)
+		{
+			temasSent = true;
+			let cv = CVar.FindCVar("gcq_temas");
+			SendTemas(cv ? cv.GetString() : "");
+			let cf = CVar.FindCVar("gcq_fechas");
+			EventHandler.SendNetworkEvent("gcq_fechas", cf ? cf.GetInt() : 0);
+		}
+		if (Menu.GetCurrentMenu()) return;
+		// 4) en fácil: elegir temas una vez por partida
+		if (difficulty == 0 && !temasShown)
+		{
+			temasShown = true;
+			Menu.SetMenu("GCTemasMenu");
+			return;
+		}
+		// 5) en fácil y en solitario: resumen del nivel anterior al empezar el siguiente
+		if (difficulty == 0 && !multiplayer && q.pvSerial != pvSeen && level.maptime > 15)
+		{
+			pvSeen = q.pvSerial;
+			Menu.SetMenu("GCResumenMenu");
+		}
+	}
+
+	// Manda los temas activos: nombres de bloque separados por | ("" = todos)
+	ui void SendTemas(String names)
+	{
+		Array<String> on;
+		if (names != "") names.Split(on, "|");
+		int chunks = (blocks.Size() + 29) / 30;
+		for (int k = 0; k < chunks; k++)
+		{
+			int mask = 0;
+			for (int j = 0; j < 30; j++)
+			{
+				int b = k * 30 + j;
+				if (b >= blocks.Size()) break;
+				if (on.Size() == 0 || on.Find(blocks[b]) != on.Size()) mask |= 1 << j;
+			}
+			EventHandler.SendNetworkEvent("gcq_tm", k, mask);
+		}
+	}
+
+	// Marcador a lo ancho de toda la pantalla: alto 200 y ancho según la pantalla (16:9 -> ~427).
+	// Con DTA_KeepRatio la letra se ve igual de grande que antes, pero x=4 es el borde izquierdo de verdad.
+	ui static double HudW()
+	{
+		return max(320.0, 240.0 * Screen.GetWidth() / max(1, Screen.GetHeight()));
+	}
+
+	ui static void HudText(int col, double x, double y, String s, double alpha = 1.0)
+	{
+		screen.DrawText(smallfont, col, x, y, s, DTA_VirtualWidthF, HudW(), DTA_VirtualHeight, 200, DTA_KeepRatio, true, DTA_Alpha, alpha);
+	}
+
+	ui void Center(String s, int col, int y)
+	{
+		screen.DrawText(smallfont, col, 160 - smallfont.StringWidth(s) / 2, y, s,
+			DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+	}
+
+	override void RenderOverlay(RenderEvent e)
+	{
+		let q = Me();
+		if (!q) return;
+		if (deathmatch) { DrawDM(q); return; }
+		double hw = HudW();
+		HudText(Font.CR_GOLD, 4, 4, String.Format("PUNTOS %d   ACIERTOS %d   FALLOS %d", q.score, q.hits, q.misses));
+		String d = "NORMAL";
+		if (difficulty < 0 && multiplayer) d = "EL ANFITRION ESTA ELIGIENDO LA DIFICULTAD...";
+		else if (difficulty == 0) d = "FACIL - MODO ESTUDIO   [P]: PREGUNTA DE REPASO";
+		else if (difficulty == 2) d = String.Format("ULTRAPESADILLA   VIDAS DE PREGUNTA: %d", q.qLives);
+		HudText(difficulty == 2 ? Font.CR_RED : Font.CR_TAN, 4, 13, d);
+		String lt = "";
+		if (q.hasBook) lt = String.Format("LIBRO [L]: %d", q.failedIdx.Size());
+		if (q.hasTomo) lt = lt .. (lt != "" ? "   " : "") .. "TEMARIO [T]";
+		hudY = 22;
+		if (lt != "") { HudText(Font.CR_GOLD, 4, 22, lt); hudY = 31; }
+
+		// Cooperativo: marcador de todos los jugadores (arriba a la derecha, debajo de lo anterior)
+		int yTiempo = hudY + 42;
+		if (multiplayer)
+		{
+			int y = hudY + 2;
+			for (int i = 0; i < MAXPLAYERS; i++)
+			{
+				if (!playeringame[i] || !ps[i]) continue;
+				String r = String.Format("%s  %d pts  %d/%d", players[i].GetUserName(16), ps[i].score, ps[i].hits, ps[i].misses);
+				HudText(i == consoleplayer ? Font.CR_GOLD : Font.CR_GREY, hw - 4 - smallfont.StringWidth(r), y, r);
+				y += 9;
+			}
+			yTiempo = max(yTiempo, y + 6);
+		}
+
+		if (q.deadTics >= 0)
+		{
+			// muerto: franja oscura con la cuenta atrás y nada más (sobre el rojo de la muerte se leería mal)
+			int y0 = Screen.GetHeight() * 74 / 200, y1 = Screen.GetHeight() * 116 / 200;
+			Screen.Dim(0, 0.75, 0, y0, Screen.GetWidth(), y1 - y0);
+			int secs = max(1, (RESPAWN_TICS - q.deadTics + 34) / 35);
+			Center(difficulty == 2 && q.qLives <= 0 ? "HAS PERDIDO LAS 3 VIDAS DE PREGUNTA" : "HAS MUERTO", Font.CR_RED, 80);
+			if (multiplayer) Center(String.Format("REAPARECES EN %d...", secs), Font.CR_WHITE, 92);
+			else Center(String.Format("EMPIEZAS DE NUEVO EN OTRO MAPA EN %d...", secs), Font.CR_WHITE, 92);
+			if (q.deadTics >= 20) Center(multiplayer ? "PULSA E PARA REAPARECER YA" : "PULSA E PARA EMPEZAR YA", Font.CR_GOLD, 104);
+			return;
+		}
+		if (tiempo && level.maptime < GCTiempo.SHOW_TICS) DrawTiempo(yTiempo, q);
+		if (q.promptVisible && q.kind == 0) DrawPrompt(q);
+		else if (q.doorPrompt && q.kind == 0)
+		{
+			Center("PULSA [E] PARA ABRIR LA PUERTA", Font.CR_GOLD, 150);
+		}
+		if (tomoHint > 0 && !q.hasTomo)
+		{
+			int ty = (q.guia ? hudY + 30 : hudY + 4) + (multiplayer ? 40 : 0);    // con la guía activa, debajo de su texto
+			Center("HAY UN TOMO CON TODO EL TEMARIO", Font.CR_ORANGE, ty);
+			Center("ESCONDIDO EN UNA ZONA SECRETA", Font.CR_ORANGE, ty + 10);
+		}
+		if (q.instaReady && (level.maptime / 8) % 2 == 0)
+			Center("DISPARO LETAL LISTO", Font.CR_RED, 120);
+		DrawGuia(e, q);
+	}
+
+	ui void DrawPrompt(GCPlayerState q)
+	{
+		String u = "PULSA [E] PARA RECOGER LA MUNICION";
+		if (q.bookItem) u = "PULSA [E] PARA COGER EL LIBRO DE REPASO";
+		else if (q.tomoItem) u = "PULSA [E] PARA COGER EL TOMO DEL TEMARIO";
+		else if (q.promptType == 1) u = "PULSA [E] PARA RECOGER EL ARMA";
+		else if (q.promptType == 2) u = "PULSA [E] PARA RECOGER LA LLAVE";
+		else if (q.promptType == 3) u = "PULSA [E] PARA RECOGER LA SALUD";
+		Center(u, Font.CR_GOLD, 150);
+		if (!q.bookItem && !q.tomoItem && q.promptType == 2) Center("HAY QUE ACERTAR 3 PREGUNTAS DIFICILES SEGUIDAS", Font.CR_ORANGE, 160);
+	}
+
+	// ---------- PvP: marcador, muerte y resultados ----------
+	ui void DrawDM(GCPlayerState q)
+	{
+		double hw = HudW();
+		// a la izquierda, en líneas cortas (a la derecha va la clasificación)
+		HudText(Font.CR_GOLD, 4, 4, String.Format("PVP  PUNTOS %d", DMPoints(q)));
+		HudText(Font.CR_WHITE, 4, 13, String.Format("BAJAS %d  ACIERTOS %d  FALLOS %d", q.dmKills, q.dmHits, q.dmMiss));
+		HudText(Font.CR_TAN, 4, 22, String.Format("MATAR +%d  ACERTAR +%d  FALLAR -%d", DM_MATAR, DM_ACIERTO, DM_FALLO));
+		String d = "";
+		if (difficulty < 0) d = "EL ANFITRION ELIGE LA DIFICULTAD...";
+		else if (difficulty == 0) d = "FACIL: PREGUNTAS CON PISTA";
+		else if (difficulty == 2) d = "ULTRAPESADILLA: 40 S POR PREGUNTA";
+		if (d != "") HudText(difficulty == 2 ? Font.CR_RED : Font.CR_TAN, 4, 31, d);
+
+		// arriba a la derecha: tiempo de la ronda y clasificación
+		Array<int> r;
+		DMRanking(r);
+		int y = 4;
+		if (dmEndTic > 0 && dmOverTic == 0)
+		{
+			int left = max(0, dmEndTic - level.maptime + 34) / 35;
+			String t = String.Format("TIEMPO %d:%02d", left / 60, left % 60);
+			HudText(left <= 30 ? Font.CR_RED : Font.CR_WHITE, hw - 4 - smallfont.StringWidth(t), y, t);
+			y += 11;
+		}
+		for (int k = 0; k < r.Size(); k++)
+		{
+			String s = String.Format("%d. %s  %d", k + 1, players[r[k]].GetUserName(10), DMPoints(ps[r[k]]));
+			HudText(r[k] == consoleplayer ? Font.CR_GOLD : Font.CR_GREY, hw - 4 - smallfont.StringWidth(s), y, s);
+			y += 9;
+		}
+
+		if (dmOverTic > 0) { DrawDMResults(r); return; }
+		if (q.deadTics >= 0)
+		{
+			if (q.kind == 5) return;                 // la pregunta ya está en pantalla
+			int y0 = Screen.GetHeight() * 74 / 200, y1 = Screen.GetHeight() * 116 / 200;
+			Screen.Dim(0, 0.75, 0, y0, Screen.GetWidth(), y1 - y0);
+			if (q.dmWait > 0)
+			{
+				Center(q.dmSkipped ? "SIN CONTESTAR" : "HAS FALLADO", Font.CR_RED, 80);
+				Center(String.Format("REAPARECES EN %d...", max(1, (q.dmWait + 34) / 35)), Font.CR_WHITE, 92);
+			}
+			else
+			{
+				Center("HAS MUERTO", Font.CR_RED, 80);
+				Center(q.kind == 5 ? "RESPONDE PARA REAPARECER" : "AHORA, UNA PREGUNTA PARA REAPARECER", Font.CR_WHITE, 92);
+				Center("ACIERTA: REAPARECES YA Y CON ARMADURA", Font.CR_GOLD, 104);
+			}
+			return;
+		}
+		if (q.promptVisible && q.kind == 0) DrawPrompt(q);
+		if (tiempo && level.maptime < GCTiempo.SHOW_TICS) DrawTiempo(max(48, y + 6), q);
+	}
+
+	ui void DrawDMResults(Array<int> r)
+	{
+		Screen.Dim(0, 0.8, 0, 0, Screen.GetWidth(), Screen.GetHeight());
+		String head = "FIN DE LA RONDA";
+		screen.DrawText(BigFont, Font.CR_UNTRANSLATED, 160 - BigFont.StringWidth(head) / 2, 14, head, DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+		if (r.Size() > 0)
+			Center(String.Format("GANA %s CON %d PUNTOS", players[r[0]].GetUserName(16), DMPoints(ps[r[0]])), Font.CR_GOLD, 40);
+		// tabla en un lienzo de 400x250 (letra algo más pequeña) para que quepan las 5 columnas
+		static const int cx[] = { 206, 256, 330, 386 };   // borde derecho de cada columna
+		static const String ch[] = { "PUNTOS", "BAJAS", "ACIERTOS", "FALLOS" };
+		int y = 74;
+		screen.DrawText(smallfont, Font.CR_TAN, 16, y, "JUGADOR", DTA_VirtualWidth, 400, DTA_VirtualHeight, 250);
+		for (int c = 0; c < 4; c++)
+			screen.DrawText(smallfont, Font.CR_TAN, cx[c] - smallfont.StringWidth(ch[c]), y, ch[c], DTA_VirtualWidth, 400, DTA_VirtualHeight, 250);
+		y += 14;
+		for (int k = 0; k < r.Size(); k++)
+		{
+			let p = ps[r[k]];
+			int col = r[k] == consoleplayer ? Font.CR_GOLD : Font.CR_WHITE;
+			screen.DrawText(smallfont, col, 16, y, String.Format("%d. %s", k + 1, players[r[k]].GetUserName(16)), DTA_VirtualWidth, 400, DTA_VirtualHeight, 250);
+			int v[4];
+			v[0] = DMPoints(p); v[1] = p.dmKills; v[2] = p.dmHits; v[3] = p.dmMiss;
+			for (int c = 0; c < 4; c++)
+			{
+				String s = String.Format("%d", v[c]);
+				screen.DrawText(smallfont, col, cx[c] - smallfont.StringWidth(s), y, s, DTA_VirtualWidth, 400, DTA_VirtualHeight, 250);
+			}
+			y += 12;
+		}
+		int secs = max(1, (DM_RESULTADOS - (level.maptime - dmOverTic) + 34) / 35);
+		let li = LevelInfo.FindLevelInfo(dmNext);
+		String nm = li ? li.LookupLevelName() : dmNext;
+		Center(String.Format("SIGUIENTE MAPA: %s EN %d...", nm.MakeUpper(), secs), Font.CR_GREEN, 152);
+	}
+
+	// ---------- guía de navegación (N) ----------
+	// Recuadro de tiempo jugado: los primeros segundos de cada mapa, arriba a la derecha
+	// (por debajo de los avisos centrados del principio, para no pisarlos).
+	ui void DrawTiempo(int y, GCPlayerState q)
+	{
+		double a = clamp((GCTiempo.SHOW_TICS - level.maptime) / 35.0, 0.0, 1.0);   // se desvanece en el último segundo
+		String l[5];
+		l[0] = "TIEMPO JUGADO";
+		l[1] = "HOY: " .. GCTiempo.Fmt(tiempo.Hoy());
+		l[2] = "7 DÍAS: " .. GCTiempo.Fmt(tiempo.Semana());
+		l[3] = "TOTAL: " .. GCTiempo.Fmt(tiempo.total);
+		int nl = 4;
+		if (q && q.progLoaded && q.today > 0) { l[4] = String.Format("REPASOS PARA HOY: %d", Pendientes(q, 0)); nl = 5; }
+		int w = 0;
+		for (int i = 0; i < nl; i++) w = max(w, smallfont.StringWidth(l[i]));
+		double hw = HudW();
+		double x = hw - 6 - w;
+		double sx = Screen.GetWidth() / hw, sy = Screen.GetHeight() / 200.0;
+		Screen.Dim(0, 0.6 * a, int((x - 4) * sx), int((y - 3) * sy), int((w + 8) * sx), int((nl * 9 + 5) * sy));
+		for (int i = 0; i < nl; i++)
+			HudText(i == 0 ? Font.CR_GOLD : i == 4 ? Font.CR_GREEN : Font.CR_WHITE, x, y + i * 9, l[i], a);
+	}
+
+	ui void DrawGuia(RenderEvent e, GCPlayerState q)
+	{
+		if (!q.guia)
+		{
+			// recordatorio al empezar cada nivel
+			if (difficulty >= 0 && level.maptime < 35 * 8 && !(difficulty == 2 && q.qLives <= 0))
+				Center("PERDIDO? PULSA [N]: GUIA DE NAVEGACION", Font.CR_ORANGE, hudY + 26 + (multiplayer ? 40 : 0));
+			return;
+		}
+		if (!guiaDraw) guiaDraw = new("GCGuiaDraw");
+		if (q.kind == 0) guiaDraw.Draw(e, q);
+		else return;
+
+		// Texto del objetivo, debajo de la dificultad
+		String t;
+		int dm = int(guiaDraw.rem / 32);
+		bool near = q.rx.Size() >= 2 && guiaDraw.rem < 80;
+		switch (q.gObj)
+		{
+		case GCNav.OBJ_EXIT:
+			t = near && q.gLine >= 0 && q.gLine < level.Lines.Size() && (level.Lines[q.gLine].activation & SPAC_Use) ? "PULSA [E] EN LA SALIDA" : String.Format("VE A LA SALIDA  (%d M)", dm);
+			break;
+		case GCNav.OBJ_SECRET: t = String.Format("SALIDA SECRETA  (%d M)", dm); break;
+		case GCNav.OBJ_SWITCH: t = String.Format(q.gExplore ? "EXPLORA: PRUEBA ESTE INTERRUPTOR  (%d M)" : "PULSA EL INTERRUPTOR  (%d M)", dm); break;
+		case GCNav.OBJ_WALK:   t = String.Format(q.gExplore ? "EXPLORA: PASA POR AQUI  (%d M)" : "PASA POR LA ZONA MARCADA  (%d M)", dm); break;
+		case GCNav.OBJ_SHOOT:  t = String.Format(q.gExplore ? "EXPLORA: DISPARA AQUI  (%d M)" : "DISPARA AL INTERRUPTOR  (%d M)", dm); break;
+		case GCNav.OBJ_KILL:   t = q.gBoss ? "MATA AL JEFE PARA ACABAR" : "MATA A LOS ENEMIGOS"; break;
+		case GCNav.OBJ_KEY:
+			t = q.gExplore ? String.Format("LA LLAVE%s ESTA POR ALLI: BUSCA COMO LLEGAR  (%d M)", GCGuiaDraw.ColorWord(q.gKey), dm)
+			               : String.Format("COGE LA LLAVE%s  (%d M)", GCGuiaDraw.ColorWord(q.gKey), dm);
+			break;
+		case GCNav.OBJ_LOCKED:
+			t = (q.gStep == GCNav.A_DOOR) ? String.Format("ABRE LA PUERTA%s CON SU LLAVE  (%d M)", GCGuiaDraw.ColorWord(q.gKey), dm)
+			                              : String.Format("PULSA EL INTERRUPTOR%s  (%d M)", GCGuiaDraw.ColorWord(q.gKey), dm);
+			break;
+		default:               t = "SIN RUTA CONOCIDA: EXPLORA"; break;
+		}
+		// en cooperativo, debajo del marcador de la derecha
+		int gy = hudY;
+		if (multiplayer)
+		{
+			gy += 2;
+			for (int i = 0; i < MAXPLAYERS; i++) if (playeringame[i] && ps[i]) gy += 9;
+		}
+		HudText(Font.CR_GOLD, 4, gy, "GUIA [N]: " .. t);
+		int ns = guiaDraw.nextStep;
+		if (ns >= 0 && ns < q.sk.Size())
+		{
+			String s = "";
+			switch (q.sk[ns])
+			{
+			case GCNav.A_DOOR:
+				s = (q.solved.Find(q.sl[ns]) != q.solved.Size()) ? "PUERTA YA RESPONDIDA, PULSA [E]" : "PUERTA, PULSA [E] Y RESPONDE";
+				break;
+			case GCNav.A_USE:   s = "INTERRUPTOR, PULSA [E]"; break;
+			case GCNav.A_CROSS: s = "PASA POR LA ZONA MARCADA"; break;
+			case GCNav.A_SHOOT: s = "DISPARA A LA PARED MARCADA"; break;
+			case GCNav.A_LIFT:  s = "ASCENSOR, PULSA [E] Y SUBETE"; break;
+			case GCNav.A_TELE:  s = "ENTRA EN EL TELETRANSPORTE"; break;
+			}
+			if (s != "") HudText(Font.CR_LIGHTBLUE, 4, gy + 9, "SIGUIENTE: " .. s);
+		}
+	}
+}
+
+// Primer disparo tras acertar una recarga: mata de un golpe.
+// Vale para todo lo que salga de ese disparo (perdigones de escopeta, cohete...).
+class GCInstaKill : Inventory
+{
+	int shotTic;   // tic en que se apretó el gatillo por primera vez (-1 = aún no)
+
+	Default
+	{
+		Inventory.MaxAmount 1;
+		+INVENTORY.UNDROPPABLE
+		+INVENTORY.UNTOSSABLE
+		+INVENTORY.UNCLEARABLE
+	}
+
+	override void PostBeginPlay()
+	{
+		Super.PostBeginPlay();
+		shotTic = -1;
+	}
+
+	override void DoEffect()
+	{
+		Super.DoEffect();
+		if (!Owner || !Owner.player) return;
+		if (shotTic < 0)
+		{
+			if (Owner.player.cmd.buttons & BT_ATTACK) shotTic = level.maptime;
+		}
+		else if (level.maptime > shotTic + 105)
+		{
+			Destroy();   // 3 segundos después del disparo deja de valer (para proyectiles lentos)
+		}
+	}
+
+	override void ModifyDamage(int damage, Name damageType, out int newdamage, bool passive,
+		Actor inflictor, Actor source, int flags)
+	{
+		if (passive || shotTic < 0 || damage <= 0) return;
+		// Solo lo que se disparó en ese gatillazo (balas en el mismo tic, proyectiles lanzados entonces)
+		int born = level.maptime;
+		if (inflictor && inflictor != Owner) born = level.maptime - inflictor.GetAge();
+		if (born <= shotTic + 2) newdamage = 999999;
+	}
+}
+
+// Libro de repaso: se coge con E y se abre con L
+class GCLibro : Inventory
+{
+	Default
+	{
+		Inventory.MaxAmount 1;
+		Inventory.PickupMessage "Has cogido el LIBRO DE REPASO. Pulsa L para abrirlo.";
+		Inventory.PickupSound "misc/i_pkup";
+		Scale 0.5;
+		Radius 16;
+		Height 16;
+		-SPECIAL
+		+INVENTORY.UNDROPPABLE
+		+INVENTORY.UNTOSSABLE
+		+FORCEXYBILLBOARD
+	}
+	States
+	{
+	Spawn:
+		GCBK A -1;
+		Stop;
+	}
+}
+
+class GCLibroMenu : GenericMenu
+{
+	GCQuiz H;
+	GCPlayerState Q;
+	Font fnt;
+	int page;
+	bool hasBook;
+
+	override void Init(Menu parent)
+	{
+		Super.Init(parent);
+		DontDim = true;
+		H = GCQuiz(StaticEventHandler.Find("GCQuiz"));
+		Q = H ? H.Me() : null;
+		fnt = smallfont;
+		page = 0;
+		let pmo = players[consoleplayer].mo;
+		hasBook = pmo && pmo.CountInv("GCLibro") > 0;
+		MenuSound("menu/activate");
+	}
+
+	int Count() { return Q ? Q.failedIdx.Size() : 0; }
+
+	override bool OnUIEvent(UIEvent ev)
+	{
+		if (ev.Type == UIEvent.Type_KeyDown)
+		{
+			int c = ev.KeyChar;
+			if (c == 0x72 || c == 0x52) { GCResumenMenu.Open(true); return true; }      // R: resumen del nivel
+			if (c == 0x6D || c == 0x4D) { Menu.SetMenu("GCTemasMenu"); return true; }    // M: temas
+		}
+		return Super.OnUIEvent(ev);
+	}
+
+	override bool MenuEvent(int mkey, bool fromcontroller)
+	{
+		int n = Count();
+		if (mkey == MKEY_Back || mkey == MKEY_Enter) { MenuSound("menu/backup"); Close(); return true; }
+		if (n > 0 && (mkey == MKEY_Right || mkey == MKEY_Down)) { page = (page + 1) % n; MenuSound("menu/cursor"); return true; }
+		if (n > 0 && (mkey == MKEY_Left || mkey == MKEY_Up)) { page = (page + n - 1) % n; MenuSound("menu/cursor"); return true; }
+		return false;
+	}
+
+	int Txt(String s, int col, int x, int y, int w)
+	{
+		BrokenLines bl = fnt.BreakLines(s, w);
+		for (int i = 0; i < bl.Count(); i++)
+		{
+			screen.DrawText(fnt, col, x, y, bl.StringAt(i), DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+			y += fnt.GetHeight() + 1;
+		}
+		return y;
+	}
+
+	override void Drawer()
+	{
+		screen.Dim(0x000000, 0.75, 0, 0, screen.GetWidth(), screen.GetHeight());
+		String head = "LIBRO DE REPASO";
+		screen.DrawText(BigFont, Font.CR_UNTRANSLATED, 160 - BigFont.StringWidth(head) / 2, 6, head,
+			DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+		int y = 30;
+		String keys = (H && H.difficulty == 0) ? "R: resumen del nivel    M: elegir temas    ESC: cerrar" : "R: resumen del nivel    ESC: cerrar";
+		if (Q)
+		{
+			int dom = 0;
+			for (int i = 0; i < Q.mastery.Size(); i++) if (Q.mastery[i] >= GCQuiz.DOMINADA) dom++;
+			Txt(String.Format("DOMINADAS: %d DE %d PREGUNTAS", dom, H.bank.Size()), Font.CR_TAN, 16, 23, 288);
+		}
+		if (!hasBook)
+		{
+			Txt("Todavia no tienes el libro. Lo encontraras al empezar el nivel.", Font.CR_GOLD, 16, y + 4, 288);
+			Txt(keys, Font.CR_TAN, 16, 190, 288);
+			return;
+		}
+		int n = Count();
+		if (n == 0)
+		{
+			Txt("No hay preguntas falladas. Las que falles apareceran aqui para repasarlas.", Font.CR_GOLD, 16, y + 4, 288);
+			Txt(keys, Font.CR_TAN, 16, 190, 288);
+			return;
+		}
+		y += 4;
+		if (page >= n) page = n - 1;
+		String line = H.bank[Q.failedIdx[page]];
+		Array<String> p;
+		line.Split(p, "|");
+		if (p.Size() < 6) return;
+		y = Txt(String.Format("%d / %d   -   %s", page + 1, n, p[0]), Font.CR_GOLD, 16, y, 288) + 3;
+		y = Txt(p[1], Font.CR_WHITE, 16, y, 288) + 5;
+		y = Txt("RESPUESTA CORRECTA:", Font.CR_GOLD, 16, y, 288) + 1;
+		y = Txt(p[2], Font.CR_GREEN, 24, y, 280) + 5;
+		if (p.Size() > 6 && p[6] != "")
+		{
+			y = Txt("DEFINICION:", Font.CR_GOLD, 16, y, 288) + 1;
+			y = Txt(p[6], Font.CR_WHITE, 16, y, 288) + 4;
+		}
+		if (H.difficulty == 0 && page < Q.failNeed.Size())
+		{
+			int need = Q.failNeed[page];
+			Txt(need >= 2 ? "Aciertala 2 veces seguidas para sacarla del libro." : "Ya la acertaste una vez: una mas y sale del libro.", Font.CR_ORANGE, 16, y, 288);
+		}
+		Txt("FLECHAS: pagina   " .. keys, Font.CR_TAN, 16, 190, 288);
+	}
+}
+
+class GCQuizMenu : GenericMenu
+{
+	GCQuiz H;
+	GCPlayerState Q;
+	Font fnt;
+	int stage;     // 0 = eligiendo, 1 = resultado
+	int sel;       // opción pulsada
+	int chosen;
+	int anim;
+	int timeLeft;  // ultrapesadilla: tics que quedan (-1 = sin límite)
+	int serial;    // pregunta de este menú (si sale otra, este se cierra)
+
+	override void Init(Menu parent)
+	{
+		Super.Init(parent);
+		DontDim = true;
+		H = GCQuiz(StaticEventHandler.Find("GCQuiz"));
+		Q = H ? H.Me() : null;
+		if (!Q) H = null;
+		fnt = smallfont;
+		stage = 0;
+		sel = 0;
+		while (Q && sel < 3 && (Q.hintMask & (1 << sel))) sel++;
+		chosen = -1;
+		timeLeft = (H && H.difficulty == 2) ? 40 * 35 : -1;
+		serial = Q ? Q.askSerial : 0;
+	}
+
+	override void Ticker()
+	{
+		anim++;
+		if (stage == 0 && Q && Q.kind == 0) { Close(); return; }   // la pregunta ya no vale (fin de ronda, reaparición...)
+		if (Q && Q.askSerial != serial) { Close(); return; }        // ha salido otra (por ejemplo, la de reaparecer al morir)
+		if (stage == 0 && timeLeft > 0 && --timeLeft == 0)
+		{
+			chosen = -1;          // se acabó el tiempo: cuenta como fallo
+			stage = 1;
+			MenuSound("menu/invalid");
+		}
+	}
+
+	void Choose(int i)
+	{
+		if (Q && (Q.hintMask & (1 << i))) { MenuSound("menu/invalid"); return; }   // descartada
+		chosen = i;
+		sel = i;
+		stage = 1;
+		MenuSound((Q && i == Q.correctIdx && Q.golden) ? "misc/p_pkup" : "menu/choose");   // dorada: sonido de premio
+	}
+
+	void Finish()
+	{
+		GCTeclas.Check();
+		if (!Q || Q.askSerial == serial) EventHandler.SendNetworkEvent("gcq_answer", chosen);
+		MenuSound("menu/choose");
+		Close();
+	}
+
+	override bool OnUIEvent(UIEvent ev)
+	{
+		if (!H) { Close(); return true; }
+		if (ev.Type == UIEvent.Type_Char || ev.Type == UIEvent.Type_KeyDown)
+		{
+			int c = ev.KeyChar;
+			if (stage == 0 && c >= 0x31 && c <= 0x34) { Choose(c - 0x31); return true; }
+			if (stage == 1 && (c == 0x20 || c == 0x0D)) { Finish(); return true; }
+		}
+		// T en el resultado: abre el tomo justo en la parte del temario de esta pregunta
+		if (stage == 1 && ev.Type == UIEvent.Type_KeyDown && (ev.KeyChar == 0x74 || ev.KeyChar == 0x54) && HasTomo())
+		{
+			Menu.SetMenu("GCTomoMenu");
+			let tm = GCTomoMenu(Menu.GetCurrentMenu());
+			if (tm) tm.Locate(H, Q.qBlock, Q.qText, Q.opt[Q.correctIdx] .. " " .. Q.qExpl);
+			return true;
+		}
+		return false;
+	}
+
+	override bool MenuEvent(int mkey, bool fromcontroller)
+	{
+		if (mkey == MKEY_Back && stage == 1) { Finish(); return true; }   // la respuesta ya cuenta
+		if (mkey == MKEY_Back)
+		{
+			EventHandler.SendNetworkEvent("gcq_abort");
+			MenuSound("menu/backup");
+			Close();
+			return true;
+		}
+		if (stage == 0) return true;           // se responde solo con 1, 2, 3 o 4
+		if (mkey == MKEY_Enter) { Finish(); return true; }
+		return false;
+	}
+
+	// Lienzo virtual: 320x200 normalmente; más grande (letra más pequeña) si la pregunta no cabe
+	int vw, vh;
+
+	// Dibuja texto con salto de línea en coordenadas del lienzo virtual
+	int Txt(Font f, String s, int col, int x, int y, int w)
+	{
+		BrokenLines bl = f.BreakLines(s, w);
+		for (int i = 0; i < bl.Count(); i++)
+		{
+			screen.DrawText(f, col, x, y, bl.StringAt(i), DTA_VirtualWidth, vw ? vw : 320, DTA_VirtualHeight, vh ? vh : 200);
+			y += f.GetHeight() + 1;
+		}
+		return y;
+	}
+
+	int TxtH(Font f, String s, int w)
+	{
+		return f.BreakLines(s, w).Count() * (f.GetHeight() + 1);
+	}
+
+
+	String OptText(int i)
+	{
+		String o = String.Format("%d) %s", i + 1, Q.opt[i]);        // 1) 2) 3) 4): se responde pulsando el número
+		if (stage == 0 && (Q.hintMask & (1 << i))) o = o .. "  (DESCARTADA)";
+		return o;
+	}
+
+	String ResultText()
+	{
+		if (Q.kind == 5)
+		{
+			// PvP: pregunta para reaparecer
+			if (chosen == Q.correctIdx && Q.golden) return "CORRECTO  +3 PUNTOS  REAPARECES YA CON MEGAESFERA (200 DE VIDA Y 200 DE ARMADURA)";
+			if (chosen == Q.correctIdx) return "CORRECTO  +3 PUNTOS  REAPARECES YA CON 100 DE ARMADURA";
+			return (chosen < 0 ? "SE ACABO EL TIEMPO" : "INCORRECTO") .. "  -1 PUNTO  REAPARECES EN 5 SEGUNDOS";
+		}
+		if (Q.kind == 3 && Q.hard)
+		{
+			// llave: 3 difíciles seguidas
+			int n = Q.keyStreak + 1;
+			if (chosen == Q.correctIdx)
+				return n >= GCQuiz.LLAVE_RACHA ? String.Format("CORRECTO  %d DE %d SEGUIDAS: COGES LA LLAVE", n, GCQuiz.LLAVE_RACHA)
+				                               : String.Format("CORRECTO  LLEVAS %d DE %d SEGUIDAS: OTRA DIFICIL", n, GCQuiz.LLAVE_RACHA);
+			String k = (chosen < 0 ? "SE ACABO EL TIEMPO" : "INCORRECTO") .. "  SIN LLAVE: PULSA E Y EMPIEZA OTRA VEZ (3 SEGUIDAS)";
+			if (H.difficulty == 2) k = k .. (Q.qLives <= 1 ? "  SIN VIDAS DE PREGUNTA: HAS MUERTO" : "  -1 VIDA DE PREGUNTA");
+			return k;
+		}
+		if (deathmatch)
+		{
+			// PvP: pregunta para coger un objeto (los puntos son los del marcador PvP)
+			if (chosen == Q.correctIdx) return Q.golden ? "CORRECTO  +3 PUNTOS  +25 DE VIDA  MUNICION DOBLE" : "CORRECTO  +3 PUNTOS";
+			String f = (chosen < 0 ? "SE ACABO EL TIEMPO" : "INCORRECTO") .. "  -1 PUNTO  NO LO RECOGES (PULSA E PARA OTRA PREGUNTA)";
+			if (H.difficulty == 2) f = f .. (Q.qLives <= 1 ? "  SIN VIDAS DE PREGUNTA: HAS MUERTO" : "  -1 VIDA DE PREGUNTA");
+			return f;
+		}
+		if (chosen == Q.correctIdx && Q.golden)
+			return H.difficulty == 2 ? "CORRECTO  +200 PUNTOS  +25 DE VIDA  MUNICION DOBLE  +1 VIDA DE PREGUNTA"
+			                         : "CORRECTO  +200 PUNTOS  +25 DE VIDA  MUNICION DOBLE";
+		if (chosen == Q.correctIdx) return Q.kind == 4 ? "CORRECTO  +50 PUNTOS  +10 DE VIDA Y MUNICION" : "CORRECTO  +50 PUNTOS";
+		String m = (chosen < 0) ? "SE ACABO EL TIEMPO" : "INCORRECTO";
+		if (H.difficulty == 2 && Q.qLives <= 1) return m .. "  SIN VIDAS DE PREGUNTA: HAS MUERTO";
+		if (Q.kind == 3) m = m .. "  NO LO RECOGES (PULSA E PARA OTRA PREGUNTA)";
+		else if (Q.kind == 4) m = m .. "  (SIN PENALIZACION)";
+		else if (H.difficulty == 0) m = m .. "  (NO PIERDES VIDA)";
+		else m = m .. "  -10 DE VIDA";
+		if (H.difficulty == 2) m = m .. "  -1 VIDA DE PREGUNTA";
+		return m;
+	}
+
+	// Alto que ocupa el contenido (bloque, pregunta, opciones y resultado) con el lienzo de tamaño k/10
+	int ContentH(int k)
+	{
+		int w = 288 * k / 10, ow = 270 * k / 10;
+		int h = TxtH(fnt, Q.qBlock, w) + 2 + TxtH(fnt, Q.qText, w) + 6;
+		for (int i = 0; i < 4; i++)
+		{
+			if (stage == 1 && i != Q.correctIdx && i != chosen) continue;
+			h += TxtH(fnt, OptText(i), ow) + 3;
+		}
+		h += 4;
+		if (stage == 1)
+		{
+			h += TxtH(fnt, ResultText(), w) + 2;
+			if (Q.qExpl != "") h += 3 + TxtH(fnt, "DEFINICION:", w) + 1 + TxtH(fnt, Q.qExpl, w);
+		}
+		return h;
+	}
+
+	override void Drawer()
+	{
+		if (!H) return;
+		screen.Dim(0x000000, Q.kind == 5 ? 0.85 : 0.65, 0, 0, screen.GetWidth(), screen.GetHeight());   // PvP: muerto, se tapa más el fondo
+
+		// Título estilo menú de DOOM (fuente grande roja)
+		String head = "RECARGAR MUNICION";
+		if (Q.kind == 5) head = "PREGUNTA PARA REAPARECER";
+		else if (Q.kind == 1) head = "PUERTA BLOQUEADA";
+		else if (Q.kind == 4) head = "PREGUNTA DE REPASO";
+		else if (Q.kind == 3)
+		{
+			if (Q.itemType == 2) head = Q.hard ? String.Format("LLAVE: DIFICIL %d DE %d", Q.keyStreak + 1, GCQuiz.LLAVE_RACHA) : "LLAVE BLOQUEADA";
+			else if (Q.itemType == 3) head = "SALUD BLOQUEADA";
+			else if (Q.itemType == 1) head = "ARMA BLOQUEADA";
+			else head = "MUNICION BLOQUEADA";
+		}
+		int hc = Font.CR_UNTRANSLATED;
+		if (stage == 1 && chosen == Q.correctIdx && Q.golden)
+		{
+			head = BigFont.CanPrint("¡") ? "¡PREGUNTA DORADA!" : "PREGUNTA DORADA";
+			hc = ((anim / 8) % 2) ? Font.CR_GOLD : Font.CR_YELLOW;
+		}
+		int tw = BigFont.StringWidth(head);
+		screen.DrawText(BigFont, hc, 160 - tw / 2, 6, head,
+			DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+
+		if (timeLeft >= 0 && stage == 0)
+		{
+			int secs = (timeLeft + 34) / 35;
+			String t = String.Format("TIEMPO: %d", secs);
+			int tc = Font.CR_GOLD;
+			if (secs <= 10) tc = ((anim / 6) % 2) ? Font.CR_RED : Font.CR_WHITE;
+			screen.DrawText(fnt, tc, 316 - fnt.StringWidth(t), 26, t, DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+		}
+		if (H.difficulty == 2)
+		{
+			String v = String.Format("VIDAS: %d", Q.qLives);
+			screen.DrawText(fnt, Font.CR_RED, 4, 26, v, DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+		}
+		// Si no cabe en 320x200, se usa un lienzo más grande (la letra se ve más pequeña)
+		int k = 10;
+		while (k < 18 && 36 * k / 10 + ContentH(k) > 186 * k / 10) k++;
+		vw = 320 * k / 10; vh = 200 * k / 10;
+		int w = 288 * k / 10, ow = 270 * k / 10;
+		int x0 = 16 * k / 10, xo = 34 * k / 10;
+		int y = 36 * k / 10;
+		y = Txt(fnt, Q.qBlock, Font.CR_GOLD, x0, y, w) + 2;
+		y = Txt(fnt, Q.qText, Font.CR_WHITE, x0, y, w) + 6;
+
+		for (int i = 0; i < 4; i++)
+		{
+			int col = Font.CR_BRICK;                    // rojo apagado de los menús de DOOM
+			if (stage == 1)
+			{
+				// En el resultado solo se ven la correcta y la elegida, para dejar sitio a la definición
+				if (i != Q.correctIdx && i != chosen) continue;
+				col = (i == Q.correctIdx) ? Font.CR_GREEN : Font.CR_RED;
+			}
+			if (stage == 0 && (Q.hintMask & (1 << i))) col = Font.CR_DARKGRAY;
+			y = Txt(fnt, OptText(i), col, xo, y, ow) + 3;
+		}
+		y += 4;
+		if (stage == 1)
+		{
+			y = Txt(fnt, ResultText(), chosen == Q.correctIdx ? Font.CR_GREEN : Font.CR_RED, x0, y, w) + 2;
+			if (Q.qExpl != "")
+			{
+				y = Txt(fnt, "DEFINICION:", Font.CR_GOLD, x0, y + 3, w) + 1;
+				Txt(fnt, Q.qExpl, Font.CR_WHITE, x0, y, w);
+			}
+		}
+		// pie de pantalla siempre a tamaño normal
+		vw = 320; vh = 200;
+		if (stage == 0) Txt(fnt, Q.kind == 5 ? "RESPONDE CON 1, 2, 3 O 4    ESC: pasar" : "RESPONDE CON 1, 2, 3 O 4      ESC: salir", Font.CR_TAN, 16, 190, 288);
+		else Txt(fnt, HasTomo() ? "ENTER: continuar     T: ver en el temario" : "ESPACIO / ENTER: continuar", Font.CR_TAN, 16, 190, 288);
+	}
+
+	bool HasTomo()
+	{
+		let pmo = players[consoleplayer].mo;
+		return pmo && pmo.CountInv("GCTomo") > 0;
+	}
+}
+
+// Tomo del temario: escondido en una zona secreta del nivel, se coge con E y se lee con T
+class GCTomo : Inventory
+{
+	Default
+	{
+		Inventory.MaxAmount 1;
+		Inventory.PickupMessage "Has encontrado el TOMO DEL TEMARIO! Pulsa T para leerlo.";
+		Inventory.PickupSound "misc/p_pkup";
+		Scale 0.5;
+		Radius 16;
+		Height 20;
+		-SPECIAL
+		+FLOATBOB
+		+INVENTORY.UNDROPPABLE
+		+INVENTORY.UNTOSSABLE
+		+FORCEXYBILLBOARD
+	}
+	override bool ShouldStay() { return multiplayer; }   // cooperativo: uno para cada jugador
+
+	States
+	{
+	Spawn:
+		GCTM A -1 Bright;
+		Stop;
+	}
+}
+
+class GCTomoMenu : GenericMenu
+{
+	const VW = 640;
+	const VH = 480;
+	const TOPY = 62;
+	const BOTY = 420;
+	Font fnt;
+	bool has;
+	Array<String> txt;      // líneas ya cortadas al ancho de la pantalla
+	Array<int> kind;        // 0 texto, 1 parte, 2 apartado, 3 subapartado, 4 aviso, 5 viñeta, 6 continuación de viñeta
+	Array<int> secStart;
+	Array<String> secName;
+	Array<int> temTemas;    // números de tema que trae el temario (# TEMA n)
+	int top, perPage;
+	// para buscar en el temario la parte de una pregunta (T en el resultado de una pregunta)
+	Array<int> srcFirst;    // por línea del temario: su primera línea en pantalla
+	Array<int> srcSec;      // y su apartado (##)
+	Array<String> srcLow;   // en minúsculas
+	Array<int> tokStart;    // sus palabras: tok[tokStart[i] .. tokStart[i + 1] - 1]
+	Array<String> tok;
+	Array<int> mSecFirst;   // apartados (##): primera línea del temario
+	Array<String> mSecDoc;  // documento del apartado (DUDH, PIDESC...), "" si no se sabe
+	int hlFrom, hlTo;       // líneas en pantalla resaltadas
+	int note;               // 0 nada, 1 encontrado, 2 apartado relacionado, 3 no está en el temario
+	bool noMark;            // al ir a una pregunta no se mueve el marcapáginas
+
+	override void Init(Menu parent)
+	{
+		Super.Init(parent);
+		DontDim = true;
+		fnt = NewSmallFont;
+		let pmo = players[consoleplayer].mo;
+		has = pmo && pmo.CountInv("GCTomo") > 0;
+		for (int lmp = Wads.FindLumpFullName("estudio/temario.txt", 0); lmp >= 0; lmp = Wads.FindLumpFullName("estudio/temario.txt", lmp + 1))
+			Build(GCTexto.Texto(lmp));
+		perPage = (BOTY - TOPY) / (fnt.GetHeight() + 2);
+		hlFrom = -1; hlTo = -1;
+		let cv = CVar.FindCVar("gc_temario_marca");
+		top = cv ? cv.GetInt() : 0;
+		Fix();
+		MenuSound("menu/activate");
+	}
+
+	void Add(String s, int k) { txt.Push(s); kind.Push(k); }
+
+	void Build(String all)
+	{
+		Array<String> src;
+		all.Split(src, "\n");
+		int w = VW - 80;
+		for (int i = 0; i < src.Size(); i++)
+		{
+			String l = src[i];
+			l.StripRight();
+			if (l.Length() == 0) continue;
+			int k = 0;
+			String body = l;
+			if (l.Left(4) == "### ") { k = 3; body = l.Mid(4); }
+			else if (l.Left(3) == "## ") { k = 2; body = l.Mid(3); }
+			else if (l.Left(2) == "# ") { k = 1; body = l.Mid(2); }
+			else if (l.Left(2) == "! ") { k = 4; body = l.Mid(2); }
+			else if (l.Left(2) == "- ") { k = 5; body = l.Mid(2); }
+			if (k == 1 || k == 2 || k == 3) { if (txt.Size() > 0 && kind[kind.Size() - 1] != 1) Add("", 0); }
+			if (k == 1 || k == 2) { secStart.Push(txt.Size()); secName.Push(body); }
+			if (k == 1 && body.Left(5) ~== "TEMA ") temTemas.Push(body.Mid(5).ToInt());
+			if (k == 2 || mSecFirst.Size() == 0) { mSecFirst.Push(srcFirst.Size()); mSecDoc.Push(""); }
+			if (k == 2) mSecDoc[mSecDoc.Size() - 1] = GCTexto.DocOfLow(GCTexto.Lower(body));
+			srcFirst.Push(txt.Size());
+			srcSec.Push(mSecFirst.Size() - 1);
+			String low = GCTexto.Lower(body);
+			srcLow.Push(low);
+			tokStart.Push(tok.Size());
+			GCTexto.Words(low, tok);
+			BrokenLines bl = fnt.BreakLines(body, k == 5 ? w - 20 : w);
+			for (int j = 0; j < bl.Count(); j++) Add(bl.StringAt(j), (k == 5 && j > 0) ? 6 : k);
+		}
+	}
+
+	int MaxTop() { return max(0, txt.Size() - perPage); }
+
+	void Fix()
+	{
+		top = clamp(top, 0, MaxTop());
+		if (noMark) return;
+		let cv = CVar.FindCVar("gc_temario_marca");
+		if (cv) cv.SetInt(top);     // marcapáginas: dura mientras el juego esté abierto
+	}
+
+	bool LineHas(int i, String w)
+	{
+		int e = (i + 1 < tokStart.Size()) ? tokStart[i + 1] : tok.Size();
+		for (int k = tokStart[i]; k < e; k++) if (tok[k] == w) return true;
+		return false;
+	}
+
+	// Busca en el temario la parte que trata la pregunta: primero el apartado (##) con más palabras
+	// poco corrientes en común, luego su línea. Si la pregunta es de un documento que no está en el
+	// temario (la Constitución, por ejemplo), lo dice.
+	void Locate(GCQuiz H, String block, String question, String extra)
+	{
+		noMark = true;
+		hlFrom = -1; hlTo = -1;
+		note = 3;
+		if (!H || srcLow.Size() == 0 || tokStart.Size() == 0) return;
+		String qlow = GCTexto.Lower(question);
+		String dq = GCTexto.DocOf(H, qlow);
+		String db = GCTexto.DocOf(H, GCTexto.Lower(block));
+		int nSec = mSecFirst.Size();
+		bool docIn = false;
+		for (int s = 0; s < nSec; s++) if (mSecDoc[s] != "" && (mSecDoc[s] == dq || (dq == "" && mSecDoc[s] == db))) docIn = true;
+		if (dq != "" && !docIn) return;                    // el documento no está en el temario
+		if (dq == "" && db != "" && !docIn) return;
+		// Los bloques del temario se llaman "T1 ...", "T2 ..."; los demás (Historia, Constitución, Leyes...)
+		// solo se buscan si la pregunta nombra un documento que sí está en el temario
+		// (y solo si el tema de ese bloque está en el temario: "T15 Leyes GC" no se busca en el Tema 1)
+		int tb = GCTexto.TemaOf(block);
+		bool temBlock = temTemas.Size() == 0 || (tb > 0 && temTemas.Find(tb) != temTemas.Size());
+		if (!temBlock && dq == "") return;
+		Array<String> qt;
+		String all = qlow .. " " .. GCTexto.Lower(extra);
+		GCTexto.Words(all, qt);
+		for (int i = qt.Size() - 1; i >= 0; i--) if (qt.Find(qt[i]) != i) qt.Delete(i);   // sin repetidas
+		Array<int> arts;
+		GCTexto.ArtNums(all, arts);
+		// cuántas líneas y cuántos apartados tienen cada palabra
+		int nL = srcLow.Size();
+		Array<double> wl, ws;
+		for (int t = 0; t < qt.Size(); t++)
+		{
+			int cntL = 0, cntS = 0, lastS = -1;
+			for (int i = 0; i < nL; i++)
+			{
+				if (!LineHas(i, qt[t])) continue;
+				cntL++;
+				if (srcSec[i] != lastS) { cntS++; lastS = srcSec[i]; }
+			}
+			wl.Push(cntL > 0 ? 1.0 / cntL : 0.0);
+			ws.Push(cntS > 0 ? 1.0 / cntS : 0.0);
+		}
+		// mejor apartado
+		int bs = -1; double bsc = -1, bTitle = 0;
+		for (int s = 0; s < nSec; s++)
+		{
+			if (dq != "" && mSecDoc[s] != dq) continue;
+			int f0 = mSecFirst[s], f1 = (s + 1 < nSec) ? mSecFirst[s + 1] : nL;
+			double sc = 0, title = 0;
+			for (int t = 0; t < qt.Size(); t++)
+			{
+				for (int i = f0; i < f1; i++) if (LineHas(i, qt[t])) { sc += ws[t]; break; }
+				if (LineHas(f0, qt[t])) title += 0.5;    // la palabra está en el título del apartado
+			}
+			// el título ayuda a elegir el apartado, pero no cuenta para decidir si la pregunta está en el temario
+			title = min(title, 1.0);
+			if (sc + title > bsc + bTitle) { bsc = sc; bTitle = title; bs = s; }
+		}
+		if (bs < 0) return;
+		// mejor línea del apartado
+		int from = mSecFirst[bs], to = (bs + 1 < nSec) ? mSecFirst[bs + 1] : nL;
+		int bl = from; double blc = -1;
+		for (int i = from; i < to; i++)
+		{
+			double sc = 0;
+			for (int t = 0; t < qt.Size(); t++) if (LineHas(i, qt[t])) sc += wl[t];
+			for (int a = 0; a < arts.Size(); a++) if (GCTexto.HasArt(srcLow[i], arts[a])) sc += 1.0;
+			if (sc > blc) { blc = sc; bl = i; }
+		}
+		double total = bsc + blc + (dq != "" ? 1.0 : 0.0);
+		if (total >= 2.6)
+		{
+			note = 1;
+			hlFrom = srcFirst[bl];
+			hlTo = (bl + 1 < nL) ? srcFirst[bl + 1] - 1 : txt.Size() - 1;
+			while (hlTo > hlFrom && txt[hlTo] == "") hlTo--;
+			top = hlFrom - 3;
+		}
+		else if (bsc >= 1.6 || (bTitle >= 1.0 && bsc + bTitle >= 2.0))
+		{
+			note = 2;
+			top = srcFirst[from] - 1;
+		}
+		else return;
+		Fix();
+	}
+
+	int CurSec()
+	{
+		int c = 0;
+		for (int i = 0; i < secStart.Size(); i++) if (secStart[i] <= top + 1) c = i;
+		return c;
+	}
+
+	void Move(int to) { int old = top; top = to; Fix(); if (top != old) MenuSound("menu/cursor"); }
+
+	override bool OnUIEvent(UIEvent ev)
+	{
+		if (ev.Type == UIEvent.Type_WheelUp) { Move(top - 3); return true; }
+		if (ev.Type == UIEvent.Type_WheelDown) { Move(top + 3); return true; }
+		return Super.OnUIEvent(ev);
+	}
+
+	override bool MenuEvent(int mkey, bool fromcontroller)
+	{
+		if (mkey == MKEY_Back) { MenuSound("menu/backup"); Close(); return true; }
+		if (!has || txt.Size() == 0) { if (mkey == MKEY_Enter) { Close(); return true; } return false; }
+		if (mkey == MKEY_Up) { Move(top - 1); return true; }
+		if (mkey == MKEY_Down) { Move(top + 1); return true; }
+		if (mkey == MKEY_Left) { Move(top - perPage); return true; }
+		if (mkey == MKEY_Right) { Move(top + perPage); return true; }
+		int c = CurSec();
+		if (mkey == MKEY_PageDown || mkey == MKEY_Enter)
+		{
+			if (c + 1 < secStart.Size()) Move(secStart[c + 1]); else Move(MaxTop());
+			return true;
+		}
+		if (mkey == MKEY_PageUp)
+		{
+			if (secStart.Size() > 0 && top > secStart[c] + 1) Move(secStart[c]);
+			else if (c > 0) Move(secStart[c - 1]);
+			else Move(0);
+			return true;
+		}
+		return false;
+	}
+
+	void Put(String s, int col, int x, int y)
+	{
+		screen.DrawText(fnt, col, x, y, s, DTA_VirtualWidth, VW, DTA_VirtualHeight, VH, DTA_KeepRatio, true);
+	}
+
+	override void Drawer()
+	{
+		screen.Dim(0x100800, 0.85, 0, 0, screen.GetWidth(), screen.GetHeight());
+		String head = "TOMO DEL TEMARIO";
+		screen.DrawText(BigFont, Font.CR_UNTRANSLATED, 160 - BigFont.StringWidth(head) / 2, 6, head,
+			DTA_VirtualWidth, 320, DTA_VirtualHeight, 240, DTA_KeepRatio, true);
+		if (!has)
+		{
+			Put("Todavía no has encontrado el TOMO DEL TEMARIO.", Font.CR_GOLD, 40, 80);
+			Put("Está escondido en una zona secreta de este nivel. Búscalo y cógelo con E.", Font.CR_WHITE, 40, 80 + fnt.GetHeight() + 4);
+			Put("ESC: cerrar", Font.CR_TAN, 40, BOTY + 12);
+			return;
+		}
+		if (txt.Size() == 0) { Put("No hay temario cargado.", Font.CR_RED, 40, 80); return; }
+		if (secName.Size() > 0) Put(secName[CurSec()], Font.CR_GOLD, 40, 40);
+		int lh = fnt.GetHeight() + 2;
+		int y = TOPY;
+		int rows = perPage;
+		if (noMark && note > 0)
+		{
+			// viene de una pregunta: una línea que dice qué se ha encontrado
+			if (note == 1) Put("> LO MARCADO EN VERDE ES LO QUE PREGUNTABA", Font.CR_GREEN, 40, y);
+			else if (note == 2) Put("> ESTE APARTADO TRATA LO QUE PREGUNTABA", Font.CR_GREEN, 40, y);
+			else Put("> ESTA PREGUNTA NO ESTA EN TU TEMARIO (SE ABRE DONDE LO DEJASTE)", Font.CR_RED, 40, y);
+			y += lh;
+			rows--;
+		}
+		for (int i = top; i < txt.Size() && i < top + rows; i++)
+		{
+			int k = kind[i];
+			int col = Font.CR_WHITE;
+			int x = 40;
+			if (i >= hlFrom && i <= hlTo) Put(">", Font.CR_GREEN, 28, y);
+			if (k == 1) col = Font.CR_RED;
+			else if (k == 2) col = Font.CR_GOLD;
+			else if (k == 3) col = Font.CR_ORANGE;
+			else if (k == 4) col = Font.CR_RED;
+			else if (k == 5) { Put("·", Font.CR_GOLD, 46, y); x = 60; }
+			else if (k == 6) x = 60;
+			if (i >= hlFrom && i <= hlTo) col = Font.CR_GREEN;
+			Put(txt[i], col, x, y);
+			y += lh;
+		}
+		int pages = max(1, (txt.Size() + perPage - 1) / perPage);
+		int pg = min(pages, top / perPage + 1);
+		if (top >= MaxTop()) pg = pages;
+		String pgs = String.Format("Página %d / %d", pg, pages);
+		Put(pgs, Font.CR_TAN, VW - 40 - fnt.StringWidth(pgs), BOTY + 10);
+		Put("ARRIBA/ABAJO o RUEDA: línea      IZQ/DER: página", Font.CR_TAN, 40, BOTY + 10);
+		Put("ENTER/AVPÁG: siguiente apartado      REPÁG: anterior      ESC: cerrar", Font.CR_TAN, 40, BOTY + 10 + lh);
+	}
+}
+
+// Menú inicial de dificultad, al estilo del "NEW GAME / Choose Skill Level" de DOOM
+class GCDificultadMenu : GenericMenu
+{
+	GCQuiz H;
+	int sel;
+	int anim;
+
+	override void Init(Menu parent)
+	{
+		Super.Init(parent);
+		DontDim = true;
+		H = GCQuiz(StaticEventHandler.Find("GCQuiz"));
+		sel = (H && H.difficulty >= 0) ? H.difficulty : 1;
+		MenuSound("menu/activate");
+	}
+
+	override void Ticker() { anim++; }
+
+	void Pick(int d)
+	{
+		GCTeclas.Check();
+		EventHandler.SendNetworkEvent("gcq_diff", d);
+		MenuSound("menu/choose");
+		Close();
+	}
+
+	override bool MenuEvent(int mkey, bool fromcontroller)
+	{
+		if (mkey == MKEY_Up) { sel = (sel + 2) % 3; MenuSound("menu/cursor"); return true; }
+		if (mkey == MKEY_Down) { sel = (sel + 1) % 3; MenuSound("menu/cursor"); return true; }
+		if (mkey == MKEY_Enter) { Pick(sel); return true; }
+		if (mkey == MKEY_Back)
+		{
+			// Si aún no se ha elegido, salir equivale a NORMAL
+			if (H && H.difficulty < 0) Pick(1); else { MenuSound("menu/backup"); Close(); }
+			return true;
+		}
+		return false;
+	}
+
+	void Patch(String nm, int x, int y, String alt)
+	{
+		TextureID tex = TexMan.CheckForTexture(nm, TexMan.Type_MiscPatch);
+		if (tex.IsValid())
+			screen.DrawTexture(tex, true, x, y, DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+		else
+			screen.DrawText(BigFont, Font.CR_UNTRANSLATED, x, y, alt, DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+	}
+
+	void Line2(String s, int col, int y)
+	{
+		screen.DrawText(smallfont, col, 160 - smallfont.StringWidth(s) / 2, y, s,
+			DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+	}
+
+	override void Drawer()
+	{
+		screen.Dim(0x000000, 0.8, 0, 0, screen.GetWidth(), screen.GetHeight());
+		Patch("M_NEWG", 96, 14, "NEW GAME");
+		Line2("ELIGE LA DIFICULTAD DE LAS PREGUNTAS", Font.CR_GOLD, 40);
+		for (int i = 0; i < 3; i++)
+		{
+			int y = 58 + 18 * i;
+			String nm = "FACIL";
+			if (i == 1) nm = "NORMAL"; else if (i == 2) nm = "ULTRAPESADILLA";
+			screen.DrawText(BigFont, Font.CR_UNTRANSLATED, 64, y, nm, DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+			if (i == sel)
+			{
+				String sk = ((anim / 8) % 2) ? "M_SKULL2" : "M_SKULL1";
+				TextureID tex = TexMan.CheckForTexture(sk, TexMan.Type_MiscPatch);
+				if (tex.IsValid())
+					screen.DrawTexture(tex, true, 32, y - 5, DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+			}
+		}
+		String a, b;
+		if (sel == 0) { a = "MODO ESTUDIO: fallar no quita vida y eliges temas."; b = "Pistas que se retiran segun vas aprendiendo."; }
+		else if (sel == 1) { a = "Fallar en puertas y recargas quita 10 de vida."; b = "Sin pistas y sin limite de tiempo."; }
+		else { a = "40 segundos por pregunta y 3 vidas de pregunta."; b = "Si las pierdes, mueres y el nivel se reinicia."; }
+		Line2(a, Font.CR_WHITE, 128);
+		Line2(b, sel == 2 ? Font.CR_RED : Font.CR_WHITE, 139);
+		if (sel == 0)
+		{
+			Line2("Las falladas vuelven hasta acertarlas 2 veces.", Font.CR_WHITE, 150);
+			Line2("Temario desde el inicio. P: pregunta de repaso.", Font.CR_WHITE, 161);
+			Line2("Municion y salud escasas: solo un tercio.", Font.CR_GOLD, 172);
+		}
+		else Line2("Municion y salud: casi nada. Recarga respondiendo.", Font.CR_GOLD, 150);
+		Line2("FLECHAS: elegir    ENTER: empezar", Font.CR_TAN, 186);
+	}
+}
+
+
+// La guía necesita una tecla. Brutal Doom trae la N para su saludo (wave2) y GZDoom guarda esa tecla en su
+// configuración, que se aplica después de controles_brutal.cfg y la pisa. Si la guía no tiene tecla y la N
+// está libre o tiene el saludo, la N pasa a la guía y el saludo a la B (si está libre). Si la N la usa otra
+// cosa, no se toca. GZDoom solo deja cambiar teclas cuando se pulsa algo dentro de un menú, así que se
+// llama al elegir la dificultad y al responder una pregunta.
+class GCTeclas ui
+{
+	static void Check()
+	{
+		CheckP();
+		int k1, k2;
+		[k1, k2] = Bindings.GetKeysForCommand("netevent gcq_guia");
+		if (k1 > 0 || k2 > 0) return;
+		String nb = Bindings.GetBinding(0x31);           // tecla N
+		if (nb != "" && !(nb ~== "wave2")) return;
+		if (nb ~== "wave2" && Bindings.GetBinding(0x30) == "") Bindings.SetBind(0x30, "wave2");   // tecla B
+		Bindings.SetBind(0x31, "netevent gcq_guia");
+		Console.Printf("Guia de navegacion: tecla N");
+	}
+
+	// Pregunta voluntaria de repaso: tecla P si está libre
+	static void CheckP()
+	{
+		int k1, k2;
+		[k1, k2] = Bindings.GetKeysForCommand("netevent gcq_vol");
+		if (k1 > 0 || k2 > 0) return;
+		if (Bindings.GetBinding(0x19) != "") return;     // tecla P
+		Bindings.SetBind(0x19, "netevent gcq_vol");
+	}
+}
+
+// Utilidades de texto para buscar una pregunta en el temario
+class GCTexto
+{
+	// Texto de un archivo del temario, sin la marca BOM que pone el Bloc de notas ("UTF-8 con BOM")
+	// ni los retornos de carro de Windows
+	static String Texto(int lump)
+	{
+		String s = Wads.ReadLump(lump);
+		if (s.Length() >= 3 && s.ByteAt(0) == 0xEF && s.ByteAt(1) == 0xBB && s.ByteAt(2) == 0xBF) s = s.Mid(3);
+		s.Replace("\r", "");
+		return s;
+	}
+
+	// Número de tema de un bloque del banco: "T4 Constitución" -> 4, "T15 Leyes GC" -> 15. 0 = no lleva número.
+	// (Sirve para buscar en el tomo; el menú de temas usa estudio/temas.txt.)
+	static int TemaOf(String blk)
+	{
+		int len = blk.Length();
+		if (len >= 2 && (blk.ByteAt(0) == 0x54 || blk.ByteAt(0) == 0x74))
+		{
+			int n = 0, i = 1;
+			while (i < len && blk.ByteAt(i) >= 0x30 && blk.ByteAt(i) <= 0x39) { n = n * 10 + blk.ByteAt(i) - 0x30; i++; }
+			if (i > 1 && (i == len || blk.ByteAt(i) == 0x20) && n >= 1 && n <= 27) return n;
+		}
+		return 0;
+	}
+
+	static String Lower(String s)
+	{
+		String r = s.MakeLower();
+		r.Replace("Á", "á"); r.Replace("É", "é"); r.Replace("Í", "í"); r.Replace("Ó", "ó");
+		r.Replace("Ú", "ú"); r.Replace("Ñ", "ñ"); r.Replace("Ü", "ü");
+		return r;
+	}
+
+	static bool IsStop(String w)
+	{
+		static const String stops[] = {
+			"para", "como", "cual", "cuál", "cuales", "cuáles", "según", "segun", "sobre", "entre",
+			"tiene", "tienen", "esta", "este", "estos", "estas", "está", "están", "todo", "toda",
+			"todos", "todas", "puede", "pueden", "debe", "deben", "será", "serán", "desde", "hasta",
+			"donde", "cuando", "quien", "quién", "qué", "porque", "sino", "otro", "otra", "otros",
+			"otras", "mismo", "misma", "dicho", "dicha", "cada", "parte", "ante", "tras", "sean",
+			"sido", "siendo", "hace", "haber", "había", "fueron", "años", "año", "artículo",
+			"articulo", "arts", "persona", "derecho", "ningún", "ninguna", "caso"
+		};
+		for (int i = 0; i < stops.Size(); i++) if (stops[i] == w) return true;
+		return false;
+	}
+
+	// Palabras de 4 letras o más, sin las muy corrientes y sin el plural final (pactos -> pacto)
+	static void Words(String low, out Array<String> outw)
+	{
+		int n = low.Length();
+		int st = -1;
+		bool afterC3 = false;
+		for (int i = 0; i <= n; i++)
+		{
+			int c = (i < n) ? low.ByteAt(i) : 0x20;
+			// letras: a-z, 0-9 y las de dos bytes que empiezan por 0xC3 (á é í ó ú ñ ü); no "¿", "¡", "º", "–"...
+			bool wc = (c >= 0x61 && c <= 0x7A) || (c >= 0x30 && c <= 0x39) || c == 0xC3 || (afterC3 && c >= 0x80 && c <= 0xBF);
+			afterC3 = c == 0xC3;
+			if (wc) { if (st < 0) st = i; continue; }
+			if (st < 0) continue;
+			String w = low.Mid(st, i - st);
+			st = -1;
+			if (w.Length() < 4 || IsStop(w)) continue;
+			int wl = w.Length();
+			if (wl > 5 && w.Mid(wl - 2) == "es") w = w.Left(wl - 2);
+			else if (wl > 4 && w.Mid(wl - 1) == "s") w = w.Left(wl - 1);
+			if (IsStop(w)) continue;
+			outw.Push(w);
+		}
+	}
+
+	// Números de artículo que se mencionan ("art. 9", "artículo 26")
+	static int NumAt(String low, int at)
+	{
+		int n = low.Length();
+		while (at < n && low.ByteAt(at) == 0x20) at++;
+		int v = 0, d = 0;
+		while (at < n && low.ByteAt(at) >= 0x30 && low.ByteAt(at) <= 0x39) { v = v * 10 + low.ByteAt(at) - 0x30; at++; d++; if (d > 4) break; }
+		return d > 0 ? v : -1;
+	}
+
+	static void ArtNums(String low, out Array<int> arts)
+	{
+		static const String pre[] = { "artículo", "articulo", "art." };
+		for (int p = 0; p < pre.Size(); p++)
+		{
+			int from = 0;
+			while (true)
+			{
+				int at = low.IndexOf(pre[p], from);
+				if (at < 0) break;
+				int v = NumAt(low, at + pre[p].Length());
+				if (v > 0 && arts.Find(v) == arts.Size()) arts.Push(v);
+				from = at + 1;
+			}
+		}
+	}
+
+	static bool HasArt(String low, int num)
+	{
+		static const String pre[] = { "artículo", "articulo", "art." };
+		for (int p = 0; p < pre.Size(); p++)
+		{
+			int from = 0;
+			while (true)
+			{
+				int at = low.IndexOf(pre[p], from);
+				if (at < 0) break;
+				if (NumAt(low, at + pre[p].Length()) == num) return true;
+				from = at + 1;
+			}
+		}
+		return false;
+	}
+
+	// Documento (DUDH, PIDESC, CE...) del que habla un texto en minúsculas, según estudio/articulos.txt
+	static String DocOf(GCQuiz H, String low)
+	{
+		if (!H) return "";
+		for (int d = 0; d < H.docKey.Size(); d++)
+		{
+			Array<String> ws;
+			H.docWords[d].Split(ws, ";");
+			for (int k = 0; k < ws.Size(); k++)
+				if (ws[k].Length() > 0 && GCQuiz.HasWord(low, Lower(ws[k]))) return H.docKey[d];
+		}
+		return "";
+	}
+
+	static String DocOfLow(String low)
+	{
+		return DocOf(GCQuiz(StaticEventHandler.Find("GCQuiz")), low);
+	}
+}
+
+// Modo estudio: elegir qué temas salen en las preguntas. SOLO FECHAS, TODOS LOS TEMAS, los grupos con sus temas
+// y dentro de cada tema sus bloques. Cada fila tiene su interruptor; los grupos y los temas con varios bloques se
+// despliegan. Los grupos y temas salen de estudio/temas.txt de cada temario:
+//     [NOMBRE DEL GRUPO]
+//     T4 = 4. Tema 4 - Derecho Constitucional      (los bloques que empiezan por "T4" van a este tema)
+// Sin temas.txt, cada bloque es un tema. Lo que se guarda es la lista de bloques encendidos (gcq_temas; vacío = todos).
+class GCTemasMenu : GenericMenu
+{
+	GCQuiz H;
+	GCPlayerState Q;
+	Array<int> on, count, dom;          // por bloque del banco
+	Array<int> blkTema;                 // tema (índice en tTitle) de cada bloque
+	Array<int> blkCut;                  // letras del principio del bloque que son su clave de tema ("T4 ")
+	Array<int> tGrp, tOpen;             // temas en el orden de la lista
+	Array<String> tTitle;
+	Array<String> kText;                // claves de tema ("T4", "Inglés"...); un tema puede tener varias: "T24, Inglés"
+	Array<int> kTema;
+	Array<String> gName;
+	Array<int> gOpen;
+	Array<int> rKind, rRef;             // filas visibles: 4 solo fechas, 0 todos, 1 grupo, 2 tema, 3 bloque
+	bool fechas;                        // SOLO FECHAS: preguntas de fechas de todos los temas
+	int nFecha, domFecha;
+	Array<int> keep;                    // temas que había antes de encender SOLO FECHAS (vuelven al apagarlo)
+	int sel;                            // fila elegida; rKind.Size() = EMPEZAR
+	int top, anim, msgTics;
+	String msg;
+	double vw, sc;                      // ancho virtual de la pantalla y píxeles por unidad
+	Array<double> hitY0, hitY1;         // filas dibujadas (para el ratón)
+	Array<int> hitRow;
+	double hitX0, hitX1, hitSw, goX0, goY0, goX1, goY1;
+	const VH = 400;
+	const LX0 = 34;                     // borde izquierdo de las filas (a la izquierda va la calavera)
+	const LTOP = 46;
+	const LBOT = 352;
+
+	override void Init(Menu parent)
+	{
+		Super.Init(parent);
+		DontDim = true;
+		H = GCQuiz(StaticEventHandler.Find("GCQuiz"));
+		Q = H ? H.Me() : null;
+		BuildTemas();
+		if (H)
+		{
+			int nb = H.blocks.Size();
+			on.Resize(nb); count.Resize(nb); dom.Resize(nb); blkTema.Resize(nb);
+			Array<String> saved;
+			let cv = CVar.FindCVar("gcq_temas");
+			String sv = cv ? cv.GetString() : "";
+			if (sv != "") sv.Split(saved, "|");
+			// si ningún nombre guardado es de este temario (se ha cambiado de temario), todos encendidos
+			bool alguno = false;
+			for (int b = 0; b < nb; b++) if (saved.Find(H.blocks[b]) != saved.Size()) alguno = true;
+			for (int b = 0; b < nb; b++) on[b] = (!alguno || saved.Find(H.blocks[b]) != saved.Size()) ? 1 : 0;
+			for (int i = 0; i < H.bank.Size(); i++)
+			{
+				int b = H.bankBlock[i];
+				bool sabe = Q && i < Q.mastery.Size() && Q.mastery[i] >= GCQuiz.DOMINADA;
+				count[b]++;
+				if (sabe) dom[b]++;
+				if (i < H.bankFecha.Size() && H.bankFecha[i]) { nFecha++; if (sabe) domFecha++; }
+			}
+			let cf = CVar.FindCVar("gcq_fechas");
+			fechas = cf && cf.GetInt() != 0 && nFecha > 0;
+			keep.Copy(on);
+			if (fechas) for (int b = 0; b < nb; b++) on[b] = 0;   // con SOLO FECHAS los temas salen apagados
+			blkCut.Resize(nb);
+			int otros = -1;
+			int nk = kText.Size();
+			for (int b = 0; b < nb; b++)
+			{
+				// el tema cuya clave es el principio más largo del nombre del bloque
+				String low = GCTexto.Lower(H.blocks[b]);
+				int t = -1, best = 0;
+				for (int i = 0; i < nk; i++)
+				{
+					String k = kText[i];
+					int kl = k.Length();
+					if (kl <= best || low.Left(kl) != k) continue;
+					if (low.Length() > kl && low.ByteAt(kl) != 0x20) continue;   // "T1" no vale para "T15 ..."
+					t = kTema[i]; best = kl;
+				}
+				if (t < 0)
+				{
+					// bloque sin tema en temas.txt: va a OTROS (o a TEMAS si no hay temas.txt) como tema propio
+					if (otros < 0) { gName.Push(nk == 0 ? "TEMAS" : "OTROS"); gOpen.Push(1); otros = gName.Size() - 1; }
+					tGrp.Push(otros); tOpen.Push(0); tTitle.Push(H.blocks[b]);
+					t = tTitle.Size() - 1;
+					best = 0;
+				}
+				blkTema[b] = t;
+				blkCut[b] = best;
+			}
+		}
+		Rows();
+		sel = rKind.Size();
+		MenuSound("menu/activate");
+	}
+
+	// Grupos y temas de estudio/temas.txt de cada temario cargado
+	void BuildTemas()
+	{
+		for (int lt = Wads.FindLumpFullName("estudio/temas.txt", 0); lt >= 0; lt = Wads.FindLumpFullName("estudio/temas.txt", lt + 1))
+		{
+			Array<String> ls;
+			GCTexto.Texto(lt).Split(ls, "\n");
+			for (int i = 0; i < ls.Size(); i++)
+			{
+				String l = ls[i];
+				l.Replace("\r", "");
+				l.StripLeft(); l.StripRight();
+				if (l.Length() == 0 || l.Left(1) == "#") continue;
+				if (l.Left(1) == "[")
+				{
+					String g = l.Mid(1);
+					int e = g.IndexOf("]");
+					if (e >= 0) g = g.Left(e);
+					g.StripLeft(); g.StripRight();
+					gName.Push(g); gOpen.Push(1);
+					continue;
+				}
+				int eq = l.IndexOf("=");
+				if (eq <= 0) continue;
+				String k = l.Left(eq); k.StripRight();
+				String v = l.Mid(eq + 1); v.StripLeft();
+				if (k ~== "NOMBRE") continue;
+				if (gName.Size() == 0) { gName.Push("TEMAS"); gOpen.Push(1); }
+				tTitle.Push(v == "" ? k : v); tGrp.Push(gName.Size() - 1); tOpen.Push(0);
+				Array<String> ks;
+				k.Split(ks, ",");
+				for (int j = 0; j < ks.Size(); j++)
+				{
+					String kk = ks[j];
+					kk.StripLeft(); kk.StripRight();
+					if (kk != "") { kText.Push(GCTexto.Lower(kk)); kTema.Push(tTitle.Size() - 1); }
+				}
+			}
+		}
+	}
+
+	void Rows()
+	{
+		rKind.Clear(); rRef.Clear();
+		rKind.Push(4); rRef.Push(0);
+		rKind.Push(0); rRef.Push(0);
+		for (int g = 0; g < gName.Size(); g++)
+		{
+			rKind.Push(1); rRef.Push(g);
+			if (!gOpen[g]) continue;
+			for (int t = 0; t < tTitle.Size(); t++)
+			{
+				if (tGrp[t] != g) continue;
+				rKind.Push(2); rRef.Push(t);
+				if (!tOpen[t] || NBlk(t) < 2) continue;
+				for (int b = 0; b < blkTema.Size(); b++) if (blkTema[b] == t) { rKind.Push(3); rRef.Push(b); }
+			}
+		}
+	}
+
+	int NBlk(int t) { int n = 0; for (int b = 0; b < blkTema.Size(); b++) if (blkTema[b] == t) n++; return n; }
+
+	bool InSet(int b, int k, int r)
+	{
+		if (k == 0) return true;
+		if (k == 1) return tGrp[blkTema[b]] == r;
+		if (k == 2) return blkTema[b] == r;
+		return b == r;
+	}
+
+	// -1 sin preguntas, 0 apagado, 1 encendido, 2 en parte
+	int StateOf(int k, int r)
+	{
+		if (k == 4) return nFecha == 0 ? -1 : fechas ? 1 : 0;
+		int n = 0, m = 0;
+		for (int b = 0; b < on.Size(); b++) if (InSet(b, k, r)) { n++; m += on[b]; }
+		if (n == 0) return -1;
+		return m == 0 ? 0 : m == n ? 1 : 2;
+	}
+
+	int Sum(int k, int r, bool dominadas)
+	{
+		int s = 0;
+		for (int b = 0; b < on.Size(); b++) if (InSet(b, k, r)) s += dominadas ? dom[b] : count[b];
+		return s;
+	}
+
+	int Chosen() { if (fechas) return nFecha; int s = 0; for (int b = 0; b < on.Size(); b++) if (on[b]) s += count[b]; return s; }
+
+	bool HasKids(int row)
+	{
+		if (row < 0 || row >= rKind.Size()) return false;
+		if (rKind[row] == 1) return true;
+		return rKind[row] == 2 && NBlk(rRef[row]) >= 2;
+	}
+
+	bool IsOpen(int row)
+	{
+		if (rKind[row] == 1) return gOpen[rRef[row]];
+		if (rKind[row] == 2) return tOpen[rRef[row]];
+		return false;
+	}
+
+	void SetOpen(int row, bool v)
+	{
+		if (!HasKids(row) || IsOpen(row) == v) return;
+		if (rKind[row] == 1) gOpen[rRef[row]] = v; else tOpen[rRef[row]] = v;
+		Rows();             // la fila sigue en el mismo sitio: sus hijas van detrás
+		MenuSound("menu/change");
+	}
+
+	int Parent(int row)
+	{
+		if (row <= 0 || row >= rKind.Size() || rKind[row] <= 1) return -1;
+		for (int i = row - 1; i >= 0; i--) if (rKind[i] < rKind[row]) return i;
+		return -1;
+	}
+
+	void Say(String s) { msg = s; msgTics = 70; }
+
+	void Toggle()
+	{
+		if (sel < 0 || sel >= rKind.Size()) return;
+		int k = rKind[sel], r = rRef[sel];
+		int st = StateOf(k, r);
+		if (k == 4)
+		{
+			if (st < 0) { Say("Todavía no hay preguntas de fechas."); MenuSound("menu/invalid"); return; }
+			int nb = on.Size();
+			if (!fechas)
+			{
+				// se apagan todos los temas; se guardan para volver a ellos al quitar SOLO FECHAS
+				keep.Copy(on);
+				for (int b = 0; b < nb; b++) on[b] = 0;
+				fechas = true;
+			}
+			else
+			{
+				fechas = false;
+				int m = 0;
+				for (int b = 0; b < keep.Size(); b++) m += keep[b];
+				for (int b = 0; b < nb; b++) on[b] = (m == 0 || b >= keep.Size()) ? 1 : keep[b];
+			}
+			MenuSound("menu/change");
+			return;
+		}
+		if (st < 0) { Say("Este tema todavía no tiene preguntas."); MenuSound("menu/invalid"); return; }
+		// encender un tema con SOLO FECHAS puesto: se quita SOLO FECHAS y queda solo ese tema
+		if (fechas) fechas = false;
+		int v = (st == 1) ? 0 : 1;
+		for (int b = 0; b < on.Size(); b++) if (InSet(b, k, r)) on[b] = v;
+		MenuSound("menu/change");
+	}
+
+	void Confirm()
+	{
+		int nb = on.Size();
+		// con SOLO FECHAS se guardan los temas de antes, para cuando se quite
+		Array<int> use;
+		if (fechas) use.Copy(keep); else use.Copy(on);
+		int n = 0;
+		for (int b = 0; b < use.Size(); b++) n += use[b];
+		if (n == 0 && !fechas) for (int b = 0; b < nb; b++) on[b] = 1;   // ninguno = todos
+		String names = "";
+		if (n > 0 && n < nb)
+			for (int b = 0; b < use.Size(); b++)
+				if (use[b]) names = names == "" ? H.blocks[b] : names .. "|" .. H.blocks[b];
+		let cv = CVar.FindCVar("gcq_temas");
+		if (cv) cv.SetString(names);
+		H.SendTemas(names);
+		let cf = CVar.FindCVar("gcq_fechas");
+		if (cf) cf.SetInt(fechas ? 1 : 0);
+		EventHandler.SendNetworkEvent("gcq_fechas", fechas ? 1 : 0);
+		GCTeclas.Check();
+		MenuSound("menu/choose");
+		Close();
+	}
+
+	override void Ticker() { anim++; if (msgTics > 0) msgTics--; }
+
+	override bool MenuEvent(int mkey, bool fromcontroller)
+	{
+		if (!H) { Close(); return true; }
+		int n = rKind.Size();
+		switch (mkey)
+		{
+		case MKEY_Up: sel = (sel + n) % (n + 1); MenuSound("menu/cursor"); return true;
+		case MKEY_Down: sel = (sel + 1) % (n + 1); MenuSound("menu/cursor"); return true;
+		case MKEY_PageUp: sel = max(0, min(sel, n) - 10); MenuSound("menu/cursor"); return true;
+		case MKEY_PageDown: sel = min(n, sel + 10); MenuSound("menu/cursor"); return true;
+		case MKEY_Enter: if (sel >= n) Confirm(); else Toggle(); return true;
+		case MKEY_Right: if (sel < n) SetOpen(sel, true); return true;
+		case MKEY_Left:
+			if (sel >= n) return true;
+			if (HasKids(sel) && IsOpen(sel)) SetOpen(sel, false);
+			else { int p = Parent(sel); if (p >= 0) { sel = p; SetOpen(p, false); } }
+			return true;
+		case MKEY_Back: Confirm(); return true;
+		}
+		return false;
+	}
+
+	override bool OnUIEvent(UIEvent ev)
+	{
+		if (H && ev.Type == UIEvent.Type_KeyDown && ev.KeyChar == 0x20 && sel < rKind.Size()) { Toggle(); return true; }
+		if (H && (ev.Type == UIEvent.Type_WheelUp || ev.Type == UIEvent.Type_WheelDown))
+		{
+			int n = rKind.Size();
+			if (ev.Type == UIEvent.Type_WheelUp) sel = max(0, min(sel, n) - 3); else sel = min(n, sel + 3);
+			return true;
+		}
+		return Super.OnUIEvent(ev);
+	}
+
+	override bool MouseEvent(int type, int mx, int my)
+	{
+		if (!H || sc <= 0 || my < 0) return false;
+		double x = mx / sc, y = my / sc;
+		if (x >= goX0 && x <= goX1 && y >= goY0 && y <= goY1)
+		{
+			sel = rKind.Size();
+			if (type == MOUSE_Release) Confirm();
+			return true;
+		}
+		for (int i = 0; i < hitRow.Size(); i++)
+		{
+			if (y < hitY0[i] || y >= hitY1[i] || x < hitX0 || x > hitX1) continue;
+			int r = hitRow[i];
+			sel = r;
+			if (type == MOUSE_Release)
+			{
+				if (x >= hitSw) Toggle();                       // en el interruptor
+				else if (HasKids(r)) SetOpen(r, !IsOpen(r));    // en la fila: desplegar
+				else Toggle();
+			}
+			return true;
+		}
+		return type == MOUSE_Click ? false : true;
+	}
+
+	// ---------- dibujo (coordenadas virtuales: alto 400, ancho según la pantalla) ----------
+
+	void Box(double x, double y, double w, double rh, Color c, double a = 1.0)
+	{
+		int x0 = int(x * sc + 0.5), y0 = int(y * sc + 0.5);
+		int x1 = int((x + w) * sc + 0.5), y1 = int((y + rh) * sc + 0.5);
+		if (x1 > x0 && y1 > y0) screen.Dim(c, a, x0, y0, x1 - x0, y1 - y0);
+	}
+
+	void Frame(double x, double y, double w, double rh, Color c, double t = 1.0)
+	{
+		Box(x, y, w, t, c); Box(x, y + rh - t, w, t, c);
+		Box(x, y, t, rh, c); Box(x + w - t, y, t, rh, c);
+	}
+
+	// DTA_KeepRatio: sin él GZDoom cree que el lienzo es 4:3 y estrecha el texto hacia el centro
+	void Str(Font f, int col, double x, double y, String s)
+	{
+		screen.DrawText(f, col, x, y, s, DTA_VirtualWidthF, vw, DTA_VirtualHeight, VH, DTA_KeepRatio, true);
+	}
+
+	void Skull(double x, double y)
+	{
+		TextureID tex = TexMan.CheckForTexture(((anim / 8) % 2) ? "M_SKULL2" : "M_SKULL1", TexMan.Type_MiscPatch);
+		if (tex.IsValid())
+			screen.DrawTexture(tex, true, x, y, DTA_VirtualWidthF, vw, DTA_VirtualHeight, VH, DTA_KeepRatio, true,
+				DTA_DestWidthF, 15.0, DTA_DestHeightF, 14.0, DTA_LeftOffset, 0, DTA_TopOffset, 0);
+	}
+
+	// flecha de desplegar: hacia abajo si está plegado, hacia arriba si está abierto (como en la academia)
+	void Chevron(double cx, double cy, bool open, Color c)
+	{
+		double d = open ? -2.5 : 2.5;
+		double th = max(1.0, 0.75 * sc);
+		screen.DrawThickLine((cx - 4) * sc, (cy - d) * sc, cx * sc, (cy + d) * sc, th, c);
+		screen.DrawThickLine(cx * sc, (cy + d) * sc, (cx + 4) * sc, (cy - d) * sc, th, c);
+	}
+
+	void DrawSwitch(double x, double y, int st, bool cur)
+	{
+		Color tr = 0x2a2a2a, ed = 0x4a4a4a, kn = 0x7a7a7a;
+		if (st == 1) { tr = 0x24702e; ed = 0x46a050; kn = 0xe0e0e0; }
+		else if (st == 2) { tr = 0x7a5a10; ed = 0xb08a28; kn = 0xe0e0e0; }
+		else if (st < 0) { tr = 0x1a1a1a; ed = 0x2a2a2a; kn = 0x3a3a3a; }
+		Box(x, y, 30, 12, tr);
+		Frame(x, y, 30, 12, cur && st >= 0 ? Color(255, 0xe0, 0xb0, 0x30) : ed);
+		double kx = st == 1 ? x + 19 : st == 2 ? x + 10 : x + 1;
+		Box(kx, y + 1, 10, 10, kn);
+		Frame(kx, y + 1, 10, 10, Color(255, 0x10, 0x10, 0x10));
+	}
+
+	// los n primeros caracteres de s (contando letras con tilde como una)
+	static String Left8(String s, int n)
+	{
+		String r = "";
+		int pos = 0;
+		for (int i = 0; i < n && pos < s.Length(); i++)
+		{
+			int ch, next;
+			[ch, next] = s.GetNextCodePoint(pos);
+			r.AppendCharacter(ch);
+			pos = next;
+		}
+		r.StripRight();
+		return r;
+	}
+
+	double RowH(int r)
+	{
+		int k = rKind[r];
+		return (k == 0 || k == 4) ? 25 : k == 1 ? 23 : k == 2 ? 18 : 15;
+	}
+
+	void DrawRow(int r, double x, double y, double w)
+	{
+		int k = rKind[r], rr = rRef[r];
+		double rh = RowH(r) - 3;
+		int st = StateOf(k, rr);
+		bool cur = (r == sel);
+		Color fill = 0x1c1c1c, edge = 0x3a3a3a;
+		if (k == 4) { fill = 0x0a1634; edge = 0x2f5ab0; }
+		else if (k == 0) { fill = 0x2c1c06; edge = 0x9a6a18; }
+		else if (k == 1) { fill = 0x300808; edge = 0x8c1c1c; }
+		else if (k == 3) { fill = 0x141414; edge = 0x2a2a2a; x += 22; w -= 22; }
+		Box(x, y, w, rh, fill, 0.96);
+		Frame(x, y, w, rh, cur ? Color(255, 0xe0, 0xb0, 0x30) : edge, cur ? 1.5 : 1.0);
+		if (cur) Skull(LX0 - 20 + (k == 3 ? 22 : 0), y + rh / 2 - 7);
+		// flecha y texto
+		double tx = x + 8;
+		if (k == 1 || k == 2)
+		{
+			if (HasKids(r)) Chevron(x + 11, y + rh / 2, IsOpen(r), k == 1 ? Color(255, 0xd8, 0xa8, 0x30) : Color(255, 0xa0, 0xa0, 0xa0));
+			tx = x + 22;
+		}
+		String label, info;
+		Font f = smallfont;
+		int col = Font.CR_WHITE;
+		if (k == 4)
+		{
+			f = BigFont; label = "SOLO FECHAS"; col = Font.CR_LIGHTBLUE;
+			info = nFecha > 0 ? String.Format("%d preg.  %d dominadas", nFecha, domFecha) : "sin preguntas";
+		}
+		else if (k == 0)
+		{
+			f = BigFont; label = "TODOS LOS TEMAS"; col = Font.CR_GOLD;
+			info = String.Format("%d preguntas", Sum(0, 0, false));
+		}
+		else if (k == 1)
+		{
+			f = BigFont; label = gName[rr]; col = Font.CR_UNTRANSLATED;
+			int c = Sum(1, rr, false);
+			info = c > 0 ? String.Format("%d preguntas", c) : "sin preguntas";
+		}
+		else if (k == 2)
+		{
+			label = tTitle[rr];
+			if (st < 0) { col = Font.CR_DARKGRAY; info = "sin preguntas"; }
+			else
+			{
+				col = st == 0 ? Font.CR_GRAY : Font.CR_WHITE;
+				info = String.Format("%d preg.  %d dominadas", Sum(2, rr, false), Sum(2, rr, true));
+			}
+		}
+		else
+		{
+			label = H.blocks[rr];
+			if (blkCut[rr] > 0 && blkCut[rr] < label.Length()) { label = label.Mid(blkCut[rr]); label.StripLeft(); }
+			col = st == 0 ? Font.CR_GRAY : Font.CR_TAN;
+			info = String.Format("%d preg.  %d dominadas", count[rr], dom[rr]);
+		}
+		if (cur && st >= 0 && k >= 2) col = Font.CR_GOLD;
+		double sx = x + w - 38;
+		double ix = sx - 8 - smallfont.StringWidth(info);
+		// si el nombre no cabe hasta el contador, se corta con "..."
+		double maxw = ix - 12 - tx;
+		if (f.StringWidth(label) > maxw)
+		{
+			int cut = label.CodePointCount();
+			String t = label;
+			while (cut > 1 && f.StringWidth(t .. "...") > maxw) { cut--; t = Left8(label, cut); }
+			label = t .. "...";
+		}
+		Str(f, col, tx, y + (rh - f.GetHeight()) / 2 + (f == BigFont ? 1 : 0.5), label);
+		if (k == 4)
+		{
+			String de = "de todos los temas";
+			Str(smallfont, Font.CR_LIGHTBLUE, tx + f.StringWidth(label) + 12, y + (rh - smallfont.GetHeight()) / 2 + 1, de);
+		}
+		Str(smallfont, st < 0 ? Font.CR_DARKGRAY : Font.CR_TAN, ix, y + (rh - smallfont.GetHeight()) / 2 + 0.5, info);
+		DrawSwitch(sx, y + (rh - 12) / 2, st, cur);
+		hitSw = sx - 4;
+
+	}
+
+	override void Drawer()
+	{
+		vw = VH * Screen.GetWidth() / max(1.0, double(Screen.GetHeight()));
+		sc = Screen.GetHeight() / double(VH);
+		screen.Dim(0x000000, 0.88, 0, 0, screen.GetWidth(), screen.GetHeight());
+		Box(0, 0, vw, 40, 0x200404, 0.7);
+		Box(0, 39, vw, 1, 0x8c1c1c);
+		String head = "TEMAS DE ESTUDIO";
+		Str(BigFont, Font.CR_UNTRANSLATED, vw / 2 - BigFont.StringWidth(head) / 2, 7, head);
+		String sub = "Elige qué temas quieres que te pregunten";
+		if (H && H.temarioName != "") sub = H.temarioName .. ": " .. sub;
+		Str(smallfont, Font.CR_GOLD, vw / 2 - smallfont.StringWidth(sub) / 2, 26, sub);
+		if (!H) return;
+
+		int n = rKind.Size();
+		double x1 = vw - 22, avail = LBOT - LTOP;
+		// que la fila elegida se vea, y que no sobre hueco al final
+		if (sel < n)
+		{
+			if (sel < top) top = sel;
+			while (top < sel && Span(top, sel + 1) > avail) top++;
+		}
+		while (top > 0 && Span(top - 1, n) <= avail) top--;
+		top = clamp(top, 0, max(0, n - 1));
+
+		hitRow.Clear(); hitY0.Clear(); hitY1.Clear();
+		hitX0 = LX0; hitX1 = x1;
+		double y = LTOP;
+		int last = top - 1;
+		for (int r = top; r < n; r++)
+		{
+			double rh = RowH(r);
+			if (y + rh - 3 > LBOT) break;
+			DrawRow(r, LX0, y, x1 - LX0);
+			hitRow.Push(r); hitY0.Push(y); hitY1.Push(y + rh - 3);
+			last = r;
+			y += rh;
+		}
+		// barra de desplazamiento
+		if (top > 0 || last < n - 1)
+		{
+			double total = Span(0, n);
+			double by = LTOP + avail * Span(0, top) / total;
+			double bh = max(12.0, avail * Span(top, last + 1) / total);
+			Box(vw - 15, LTOP, 4, avail, 0x202020);
+			Box(vw - 15, by, 4, min(bh, LBOT - by), 0x8c1c1c);
+		}
+		// pie: preguntas elegidas, teclas y EMPEZAR
+		Box(0, LBOT + 4, vw, 1, 0x8c1c1c);
+		if (msgTics > 0) Str(smallfont, Font.CR_RED, LX0, LBOT + 12, msg);
+		else if (fechas) Str(smallfont, Font.CR_LIGHTBLUE, LX0, LBOT + 12, String.Format("Preguntas elegidas: %d de fechas, de todos los temas", Chosen()));
+		else Str(smallfont, Font.CR_GOLD, LX0, LBOT + 12, String.Format("Preguntas elegidas: %d de %d", Chosen(), Sum(0, 0, false)));
+		Str(smallfont, Font.CR_TAN, LX0, LBOT + 27, "ENTER o ESPACIO: marcar    DERECHA / IZQUIERDA: abrir / cerrar");
+		Str(smallfont, Font.CR_TAN, LX0, LBOT + 38, "ESC: empezar    (también con el ratón)");
+		String go = "EMPEZAR";
+		double bw = BigFont.StringWidth(go) + 36, bh = 28;
+		goX1 = x1; goX0 = x1 - bw; goY0 = LBOT + 12; goY1 = goY0 + bh;
+		bool gs = sel >= n;
+		Box(goX0, goY0, bw, bh, gs ? 0x2a6a36 : 0x1d4a26, 0.96);
+		Frame(goX0, goY0, bw, bh, gs ? Color(255, 0xe0, 0xb0, 0x30) : Color(255, 0x3f, 0x8f, 0x50), gs ? 1.5 : 1.0);
+		Str(BigFont, gs ? Font.CR_GOLD : Font.CR_WHITE, goX0 + 18, goY0 + (bh - BigFont.GetHeight()) / 2 + 1, go);
+		if (gs) Skull(goX0 - 20, goY0 + bh / 2 - 7);
+	}
+
+	double Span(int a, int b)
+	{
+		double s = 0;
+		for (int r = a; r < b && r < rKind.Size(); r++) s += RowH(r);
+		return s;
+	}
+}
+
+// Resumen de lo respondido en un nivel: aciertos por bloque y lo que hay que repasar
+class GCResumenMenu : GenericMenu
+{
+	GCQuiz H;
+	GCPlayerState Q;
+	bool current;            // true = nivel actual (desde el libro), false = el que acabas de terminar
+	Array<String> lines;
+	Array<int> cols;
+	int top;
+	const ROWS = 15;
+
+	static void Open(bool cur)
+	{
+		Menu.SetMenu("GCResumenMenu");
+		let m = GCResumenMenu(Menu.GetCurrentMenu());
+		if (m) m.Setup(cur);
+	}
+
+	override void Init(Menu parent)
+	{
+		Super.Init(parent);
+		DontDim = true;
+		H = GCQuiz(StaticEventHandler.Find("GCQuiz"));
+		Q = H ? H.Me() : null;
+		MenuSound("menu/activate");
+		Setup(false);
+	}
+
+	void Add(String s, int col)
+	{
+		BrokenLines bl = smallfont.BreakLines(s, 280);
+		for (int i = 0; i < bl.Count(); i++) { lines.Push(bl.StringAt(i)); cols.Push(col); }
+	}
+
+	void Setup(bool cur)
+	{
+		current = cur;
+		lines.Clear(); cols.Clear();
+		top = 0;
+		if (!H || !Q) return;
+		int asked = cur ? Q.lvAsked : Q.pvAsked;
+		String map = cur ? (level.MapName .. " - " .. level.LevelName) : Q.pvMap;
+		Add(map, Font.CR_GOLD);
+		if (asked <= 0) { Add("Todavia no has respondido preguntas en este nivel.", Font.CR_WHITE); return; }
+		int th = 0, tm = 0;
+		for (int b = 0; b < H.blocks.Size(); b++)
+		{
+			th += cur ? Q.lvHit[b] : Q.pvHit[b];
+			tm += cur ? Q.lvMiss[b] : Q.pvMiss[b];
+		}
+		Add(String.Format("ACIERTOS %d   FALLOS %d   (%d%%)", th, tm, (th + tm) > 0 ? th * 100 / (th + tm) : 0), Font.CR_WHITE);
+		Add("", Font.CR_WHITE);
+		Add("POR BLOQUE:", Font.CR_GOLD);
+		for (int b = 0; b < H.blocks.Size(); b++)
+		{
+			int nh = cur ? Q.lvHit[b] : Q.pvHit[b];
+			int nm = cur ? Q.lvMiss[b] : Q.pvMiss[b];
+			if (nh + nm == 0) continue;
+			int pct = nh * 100 / (nh + nm);
+			Add(String.Format("  %s:  %d de %d  (%d%%)", H.blocks[b], nh, nh + nm, pct), pct >= 80 ? Font.CR_GREEN : pct >= 50 ? Font.CR_GOLD : Font.CR_RED);
+		}
+		Array<int> fl;
+		if (cur) fl.Copy(Q.lvFailed); else fl.Copy(Q.pvFailed);
+		Add("", Font.CR_WHITE);
+		if (fl.Size() == 0) Add("Sin fallos en este nivel. Muy bien!", Font.CR_GREEN);
+		else
+		{
+			Add(String.Format("PARA REPASAR (%d):", fl.Size()), Font.CR_GOLD);
+			for (int i = 0; i < fl.Size(); i++)
+			{
+				if (fl[i] < 0 || fl[i] >= H.bank.Size()) continue;
+				Array<String> p;
+				H.bank[fl[i]].Split(p, "|");
+				if (p.Size() < 3) continue;
+				Add("- " .. p[1], Font.CR_WHITE);
+				Add("    " .. p[2], Font.CR_GREEN);
+			}
+		}
+		int dom = 0;
+		for (int i = 0; i < Q.mastery.Size(); i++) if (Q.mastery[i] >= GCQuiz.DOMINADA) dom++;
+		Add("", Font.CR_WHITE);
+		Add(String.Format("LIBRO DE REPASO: %d pendientes    DOMINADAS: %d de %d", Q.failedIdx.Size(), dom, H.bank.Size()), Font.CR_TAN);
+	}
+
+	override bool MenuEvent(int mkey, bool fromcontroller)
+	{
+		int mx = max(0, lines.Size() - ROWS);
+		if (mkey == MKEY_Back || mkey == MKEY_Enter) { MenuSound("menu/backup"); Close(); return true; }
+		if (mkey == MKEY_Up) { top = max(0, top - 1); return true; }
+		if (mkey == MKEY_Down) { top = min(mx, top + 1); return true; }
+		if (mkey == MKEY_PageUp || mkey == MKEY_Left) { top = max(0, top - ROWS); return true; }
+		if (mkey == MKEY_PageDown || mkey == MKEY_Right) { top = min(mx, top + ROWS); return true; }
+		return false;
+	}
+
+	override bool OnUIEvent(UIEvent ev)
+	{
+		int mx = max(0, lines.Size() - ROWS);
+		if (ev.Type == UIEvent.Type_WheelUp) { top = max(0, top - 2); return true; }
+		if (ev.Type == UIEvent.Type_WheelDown) { top = min(mx, top + 2); return true; }
+		return Super.OnUIEvent(ev);
+	}
+
+	override void Drawer()
+	{
+		screen.Dim(0x000000, 0.8, 0, 0, screen.GetWidth(), screen.GetHeight());
+		String head = current ? "RESUMEN DEL NIVEL" : "NIVEL TERMINADO";
+		screen.DrawText(BigFont, Font.CR_UNTRANSLATED, 160 - BigFont.StringWidth(head) / 2, 6, head,
+			DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+		int y = 28;
+		for (int i = top; i < lines.Size() && i < top + ROWS; i++)
+		{
+			screen.DrawText(smallfont, cols[i], 20, y, lines[i], DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+			y += 10;
+		}
+		String f = lines.Size() > ROWS ? "FLECHAS: subir/bajar     ENTER: seguir jugando" : "ENTER: seguir jugando";
+		screen.DrawText(smallfont, Font.CR_TAN, 16, 190, f, DTA_VirtualWidth, 320, DTA_VirtualHeight, 200);
+	}
+}
+
+
+// Marca invisible: el inventario ya pasó por el arranque del mod (no se vuelve a recortar la munición)
+class GCStartToken : Inventory
+{
+	Default
+	{
+		Inventory.MaxAmount 1;
+		+INVENTORY.UNDROPPABLE
+		+INVENTORY.UNTOSSABLE
+	}
+}
+
+// ---------- Tiempo jugado ----------
+// Cuenta el tiempo en un mapa (con el juego en marcha o respondiendo en los menús del mod; no con el
+// menú principal, la consola o el juego en pausa). Se guarda en el cvar gcq_horas (en el .ini de GZDoom):
+// "T:<segundos en total>,AAAAMMDD:<segundos ese día>,..." (los últimos 60 días jugados).
+class GCTiempo ui
+{
+	const SHOW_TICS = 35 * 5;      // se ve los primeros 5 segundos de juego de cada mapa
+
+	int total;
+	Array<int> dia, seg;
+	int tics, unsaved, lastMaptime;
+
+	static GCTiempo Load()
+	{
+		let t = new("GCTiempo");
+		t.lastMaptime = -1;
+		let cv = CVar.FindCVar("gcq_horas");
+		String s = cv ? cv.GetString() : "";
+		Array<String> parts;
+		s.Split(parts, ",", TOK_SKIPEMPTY);
+		for (int i = 0; i < parts.Size(); i++)
+		{
+			String p = parts[i];
+			if (p.Left(2) == "T:") t.total = p.Mid(2).ToInt();
+			else if (p.Length() > 9 && p.Mid(8, 1) == ":") { t.dia.Push(p.Left(8).ToInt()); t.seg.Push(p.Mid(9).ToInt()); }
+		}
+		return t;
+	}
+
+	void Save()
+	{
+		String s = String.Format("T:%d", total);
+		for (int i = max(0, dia.Size() - 60); i < dia.Size(); i++) s = s .. String.Format(",%d:%d", dia[i], seg[i]);
+		let cv = CVar.FindCVar("gcq_horas");
+		if (cv) cv.SetString(s);
+		unsaved = 0;
+	}
+
+	static int DayKey(int now) { return SystemTime.Format("%Y%m%d", now).ToInt(); }
+
+	void Tick()
+	{
+		if (gamestate != GS_LEVEL) { lastMaptime = -1; return; }
+		bool activo = lastMaptime >= 0 && level.maptime != lastMaptime;    // el juego avanza
+		lastMaptime = level.maptime;
+		if (!activo)
+		{
+			let m = Menu.GetCurrentMenu();                                  // o estás respondiendo / repasando
+			String mn = "";
+			if (m) mn = m.GetClassName();
+			activo = mn.Left(2) == "GC";
+		}
+		if (!activo || ++tics < 35) return;
+		tics = 0;
+		total++;
+		int d = DayKey(SystemTime.Now());
+		int n = dia.Size();
+		if (n > 0 && dia[n - 1] == d) seg[n - 1]++;
+		else { dia.Push(d); seg.Push(1); }
+		if (++unsaved >= 5) Save();
+	}
+
+	int Hoy()
+	{
+		int n = dia.Size();
+		return (n > 0 && dia[n - 1] == DayKey(SystemTime.Now())) ? seg[n - 1] : 0;
+	}
+
+	int Semana()
+	{
+		int now = SystemTime.Now(), sum = 0;
+		for (int k = 0; k < 7; k++)
+		{
+			int d = DayKey(now - k * 86400);
+			for (int i = dia.Size() - 1; i >= 0 && i >= dia.Size() - 8; i--) if (dia[i] == d) sum += seg[i];
+		}
+		return sum;
+	}
+
+	static String Fmt(int secs)
+	{
+		int m = secs / 60, h = m / 60;
+		m %= 60;
+		return h > 0 ? String.Format("%d H %02d MIN", h, m) : String.Format("%d MIN", m);
+	}
+}
+
+// ---------- Aviso al salir (Esc > Salir / F10) ----------
+// Saber que mañana te van a preguntar ayuda a que el sueño fije lo estudiado. La caja de "¿salir?" de GZDoom
+// se sustituye por esta (MAPINFO: MessageBoxClass); solo cambia el mensaje de salir, los demás quedan igual.
+class GCMessageBox : MessageBoxMenu
+{
+	override void Init(Menu parent, String message, int messagemode, bool playsound, Name cmd, voidptr native_handler)
+	{
+		String dosy = StringTable.Localize("$DOSY");
+		int n = message.Length(), nd = dosy.Length();
+		if (nd > 0 && n > nd && message.Mid(n - nd) == dosy)
+		{
+			String extra = AvisoSalida();
+			if (extra != "") message = message.Left(n - nd) .. extra .. "\n\n" .. dosy;
+		}
+		Super.Init(parent, message, messagemode, playsound, cmd, native_handler);
+	}
+
+	static String AvisoSalida()
+	{
+		let h = GCQuiz(StaticEventHandler.Find("GCQuiz"));
+		if (!h) return "";
+		let q = h.Me();
+		if (!q || !q.progLoaded || q.today <= 0) return "";
+		int n = h.Pendientes(q, 1);
+		String s;
+		if (n == 0) s = "MAÑANA NO TIENES REPASOS PENDIENTES.";
+		else if (n == 1) s = "MAÑANA TE ESPERA 1 PREGUNTA DE REPASO.";
+		else s = String.Format("MAÑANA TE ESPERAN %d PREGUNTAS DE REPASO.", n);
+		return s .. "\nDORMIR BIEN AYUDA A FIJAR LO ESTUDIADO.\nSI HACES DEPORTE, MEJOR UNAS HORAS DESPUÉS DE ESTUDIAR.";
+	}
+}

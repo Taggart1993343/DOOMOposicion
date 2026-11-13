@@ -1,0 +1,11 @@
+AddKeySection "Modo estudio" DoomEstudio
+AddMenuKey "Recoger / usar (pregunta)" "netevent gcq_use"
+AddMenuKey "Abrir libro de repaso" "openmenu GCLibroMenu"
+AddMenuKey "Recargar con pregunta" "netevent gcq_reload"
+AddMenuKey "Ver puntuacion" "netevent gcq_stats"
+AddMenuKey "Leer el tomo del temario" "openmenu GCTomoMenu"
+AddMenuKey "Cambiar dificultad" "openmenu GCDificultadMenu"
+AddMenuKey "Guia de navegacion (como Boltgun)" "netevent gcq_guia"
+AddMenuKey "Pregunta de repaso (modo facil)" "netevent gcq_vol"
+AddMenuKey "Elegir temas de estudio (modo facil)" "openmenu GCTemasMenu"
+AddMenuKey "PvP en solitario: menu de bots" "openmenu GCBotsMenu"

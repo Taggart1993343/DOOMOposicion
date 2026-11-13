@@ -1,0 +1,213 @@
+﻿==========================================================
+   DOOM ESTUDIO - CONTROLES
+==========================================================
+
+ Jugar.bat ........... DOOM normal
+ Jugar_Brutal.bat .... Brutal Doom
+
+ Las preguntas salen del TEMARIO que elijas: cada temario es una
+ carpeta dentro de Temarios. Si hay más de uno, el .bat te pregunta
+ cuál (Enter = el de la última vez). Para hacer el tuyo, mira
+ Temarios\COMO_CREAR_UN_TEMARIO.txt.
+
+ Cada vez que lanzas un .bat, la partida empieza en un mapa al
+ azar (episodios 1 a 4, mapas 1 a 7; nunca en los de jefe).
+
+ Si mueres, a los 3 segundos (o pulsando E) empiezas de cero
+ en otro mapa al azar: pistola, súper escopeta, la munición
+ justa y los puntos a cero. Lo que has estudiado se guarda.
+
+ Al empezar cada mapa sale arriba a la derecha, 5 segundos,
+ tu TIEMPO JUGADO: hoy, últimos 7 días y total. Solo cuenta
+ mientras juegas o respondes (no con el menú ni en pausa) y se
+ guarda en este ordenador, igual que lo que has estudiado.
+ Debajo sale cuántas preguntas te toca REPASAR HOY.
+
+ Las teclas del mod se ponen solas al arrancar con esos .bat
+ (vienen en la carpeta Controles).
+ Para cambiarlas: Esc > Opciones > Controles > "Modo estudio".
+
+
+----------------------------------------------------------
+ 1. MOVERSE Y DISPARAR (las de GZDoom por defecto)
+----------------------------------------------------------
+
+ W / S / A / D ........ avanzar / retroceder / moverse de lado
+ Ratón ................ mirar
+ Clic izquierdo ....... disparar
+ Clic derecho ......... disparo secundario
+ Espacio .............. saltar
+ X .................... agacharse (solo en DOOM normal)
+ Mayús ................ correr (Bloq Mayús: correr siempre)
+ 1 a 7 / rueda ........ cambiar de arma
+ Tab .................. mapa
+ F6 / F9 .............. guardar rápido / cargar rápido
+ Esc .................. menú
+ º .................... consola (la tecla a la izquierda del 1)
+
+
+----------------------------------------------------------
+ 2. TECLAS DEL MOD
+----------------------------------------------------------
+
+ E .... Abrir puertas (te hace una pregunta), pulsar
+        interruptores y recoger cosas: munición, armas,
+        llaves y salud (pregunta), y el libro y el tomo.
+        LLAVES: hay que acertar 3 preguntas DIFÍCILES
+        seguidas (de las que más fallas, sin pistas).
+        Si fallas una, no hay llave: pulsa E y empieza
+        otra vez.
+ R .... Recargar con pregunta (DOOM normal). Si aciertas:
+        munición y el siguiente disparo mata de un golpe.
+ Y .... Recargar con pregunta (Brutal Doom; ahí la R es la
+        recarga normal de Brutal Doom).
+ L .... Libro de repaso: las preguntas que has fallado.
+ T .... Tomo del temario.
+ N .... Guía de navegación: te marca el siguiente
+        objetivo, paso a paso: la llave que te falta, la
+        puerta de esa llave, el interruptor que abre el
+        paso... y, cuando ya está todo abierto, la salida.
+        Púlsala otra vez para quitarla.
+ P .... Pregunta de repaso cuando quieras (solo en FÁCIL).
+        Si aciertas: +10 de vida y munición. Si fallas,
+        no pasa nada.
+
+ La pregunta de recarga solo sale cuando tú pulsas R (o Y
+ en Brutal Doom). Si te quedas sin balas y disparas, no
+ sale sola: decides tú cuándo recargar.
+
+
+----------------------------------------------------------
+ 3. ARMAS, MUNICIÓN Y SALUD
+----------------------------------------------------------
+
+ Solo hay 4 armas (y el puño):
+   - Pistola
+   - Escopeta (se encuentra en el mapa)
+   - Superescopeta (se empieza con ella; en DOOM normal hace falta
+     Mod\SuperEscopeta_DOOM2.pk3, si no, se empieza con la escopeta)
+   - Rifle (solo en Brutal Doom: aparece donde antes
+     había una ametralladora y lo sueltan los zombis)
+ Las demás armas, los cohetes, las celdas y las granadas
+ no aparecen.
+
+ Munición al empezar una partida (contando el cargador):
+   - FÁCIL: 20 balas y 8 cartuchos.
+   - NORMAL y ULTRAPESADILLA: 8 balas y 4 cartuchos.
+ Al pasar de nivel te quedas con lo que tengas.
+
+ La munición y la salud escasean:
+   - FÁCIL: queda un tercio de lo que trae el mapa.
+   - NORMAL y ULTRAPESADILLA: casi nada.
+ Lo que sueltan los enemigos también escasea.
+ Para seguir avanzando hay que recargar respondiendo
+ preguntas (R o Y) y recoger lo poco que haya (E).
+
+
+----------------------------------------------------------
+ 4. SOLO EN BRUTAL DOOM
+----------------------------------------------------------
+
+ Q .... patada
+ F .... linterna
+ X .... llevar dos armas (doble empuñadura)
+ H .... insultar
+ V .... saludo
+ B .... saludo 2
+ J .... burlas
+ K .... frases
+
+
+----------------------------------------------------------
+ 5. DENTRO DE LOS MENÚS DEL MOD
+----------------------------------------------------------
+
+ PREGUNTA
+   1, 2, 3 o 4 ...... responder (solo con los números)
+   Esc .............. salir sin responder (puedes volver a
+                      intentarlo enseguida)
+   Después de responder:
+   Enter ............ seguir jugando
+   T ................ ver la respuesta en el temario
+                      (sale marcada en verde)
+
+ LIBRO DE REPASO (L)
+   Flechas .......... pasar página
+   R ................ resumen del nivel (aciertos y fallos)
+   M ................ elegir temas de estudio (solo FÁCIL)
+   Esc .............. cerrar
+
+ TOMO DEL TEMARIO (T)
+   Arriba/Abajo o rueda ... bajar o subir una línea
+   Izquierda/Derecha ...... pasar página
+   Enter o AvPág .......... siguiente apartado
+   RePág .................. apartado anterior
+   Esc .................... cerrar
+
+ TEMAS DE ESTUDIO (sale al elegir FÁCIL)
+   Arriba / Abajo ... moverse (Re Pág / Av Pág: de 10 en 10)
+   Enter o Espacio .. encender o apagar (TODOS, un grupo, un tema o un bloque)
+   Derecha .......... desplegar un grupo o un tema con varios bloques
+   Izquierda ........ plegarlo
+   Ratón ............ clic en el interruptor: encender o apagar;
+                      clic en la fila: desplegar o plegar
+   Esc o EMPEZAR .... empezar a jugar
+   SOLO FECHAS ...... la primera fila: al encenderla se apagan todos los temas
+                      y solo te preguntan fechas, de todos los temas.
+                      Si la apagas, vuelven los temas que tenías.
+                      Si enciendes un tema, SOLO FECHAS se apaga y queda ese tema.
+
+ RESUMEN DEL NIVEL (sale al terminar cada nivel en FÁCIL)
+   Flechas .......... subir y bajar
+   Enter ............ seguir jugando
+
+
+----------------------------------------------------------
+ 6. DIFICULTADES
+----------------------------------------------------------
+
+ FÁCIL (modo estudio)
+   - Fallar no quita vida.
+   - Munición y salud: un tercio de lo normal.
+   - Eliges los temas que te preguntan.
+   - Pistas: se descartan respuestas incorrectas, y cuantos
+     más días aciertas una pregunta, menos ayuda te da.
+   - Las falladas vuelven a salir hasta acertarlas 2 veces.
+   - Tienes el tomo del temario desde el principio.
+   - Tu progreso se guarda en tu ordenador.
+
+ NORMAL
+   - Fallar en puertas y recargas quita 10 de vida.
+   - Munición y salud: casi nada.
+   - Sin pistas y sin límite de tiempo.
+
+ ULTRAPESADILLA
+   - 40 segundos por pregunta y 3 vidas de pregunta.
+   - Munición y salud: casi nada.
+   - Si las pierdes, mueres y empiezas de nuevo en otro mapa.
+
+
+----------------------------------------------------------
+ 7. CÓMO TE AYUDA A ESTUDIAR
+----------------------------------------------------------
+
+ REPASO POR DÍAS (en todas las dificultades)
+   - Cada pregunta que aciertas vuelve dentro de 1, 3, 7, 14
+     y 30 días. Las que te tocan hoy salen antes que las demás.
+   - Acertarla otra vez el mismo día no la adelanta: cuenta
+     acertar en días distintos.
+   - DOMINADA = acertada en 3 días distintos.
+   - Si la fallas, vuelve a salir en la misma partida (en
+     FÁCIL, con el libro) y otra vez al día siguiente.
+
+ PREGUNTA DORADA
+   - 1 de cada 10 preguntas es dorada, pero no se sabe hasta
+     que la aciertas.
+   - Premio: 200 puntos, +25 de vida y munición doble (y en
+     ULTRAPESADILLA, +1 vida de pregunta).
+
+ AL SALIR (Esc > Salir del juego, o F10)
+   - Te dice cuántas preguntas de repaso te esperan mañana.
+     Saber que mañana te van a preguntar ayuda a que el sueño
+     fije lo estudiado. Si cierras con la X de la ventana no
+     sale el aviso.

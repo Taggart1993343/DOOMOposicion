@@ -1,0 +1,2 @@
+﻿Copia aquí GZDoom (4.14 o superior): gzdoom.exe y el resto de archivos de su .zip.
+Se descarga gratis de https://zdoom.org/downloads

@@ -1,0 +1,15 @@
+// PvP en solitario (Probar_PvP_Solo.bat): añadir bots, jugadores que maneja el ordenador
+OptionMenu "GCBotsMenu"
+{
+	Title "PRUEBA PVP EN SOLITARIO"
+	StaticText "Añade bots (jugadores que maneja el ordenador)", 1
+	StaticText "para probar el PvP tú solo.", 1
+	StaticText ""
+	StaticText "Pulsa ENTER en 'Añadir un bot' una vez por cada bot (3 o 4 va bien).", 0
+	StaticText ""
+	Command "Añadir un bot", "addbot"
+	Command "Quitar todos los bots", "removebots"
+	StaticText ""
+	StaticText "Cuando termines, pulsa ESC para jugar.", 1
+	StaticText "Este menú se vuelve a abrir desde la consola con: openmenu GCBotsMenu", 0
+}

@@ -1,0 +1,74 @@
+﻿CÓMO CREAR TU PROPIO TEMARIO PARA EL MODO ESTUDIO DE DOOM
+
+El mod (Mod\DoomEstudio.pk3) no lleva preguntas dentro: las lee de un TEMARIO, que es una
+carpeta dentro de esta carpeta Temarios. Así cualquiera puede estudiar lo que quiera
+(oposiciones, idiomas, carnet de conducir, historia...) con el mismo juego.
+
+  Temarios\Ejemplo           un temario pequeño de ejemplo (geografía e historia) para copiar
+
+Las carpetas que empiezan por _ no salen en la lista: sirve para guardar un temario
+que no quieres usar ahora (por ejemplo, _Ingles).
+
+
+1. CREAR UN TEMARIO NUEVO
+   1) Copia la carpeta Ejemplo y pega la copia aquí mismo, en Temarios.
+   2) Cámbiale el nombre. Por ejemplo: Ingles o CarnetB.
+   3) Abre los archivos de su carpeta estudio con el Bloc de notas (o VS Code) y cámbialos:
+        preguntas.txt   las preguntas (obligatorio)
+        temas.txt       cómo se ordenan en el menú de temas (opcional)
+        temario.txt     el texto del TOMO DEL TEMARIO, tecla T (opcional)
+   4) Guarda siempre en UTF-8 para que salgan bien las tildes y la ñ
+      (Bloc de notas: Archivo > Guardar como > Codificación: UTF-8).
+   5) Abre Jugar.bat. Si hay más de un temario, te pregunta cuál quieres
+      (con Enter coge el de la última vez).
+
+
+2. preguntas.txt
+   Una pregunta por línea, con los campos separados por la barra |
+
+     bloque|pregunta|respuesta correcta|incorrecta 1|incorrecta 2|incorrecta 3|explicación
+
+   Ejemplo:
+     T1 Geografía|¿Cuál es la capital de Portugal?|Lisboa|Oporto|Coímbra|Braga|Lisboa es la capital.
+
+   - La correcta va siempre la tercera: el juego baraja las opciones.
+   - El bloque agrupa preguntas. Si empieza por la clave de un tema de temas.txt (T1, T2...),
+     sale dentro de ese tema en el menú. Un tema puede tener varios bloques
+     (T1 Geografía, T1 Ríos...) y en el menú se pueden encender y apagar por separado.
+   - "Todas son correctas" o "Ninguna es correcta" se ponen solas al final.
+   - Si las opciones se refieren unas a otras ("Las respuestas a) y b) son correctas"),
+     añade al final |fijo:N: salen en el orden escrito y la correcta en la posición N.
+   - SOLO FECHAS coge sola las preguntas cuya respuesta lleva un año o un mes.
+     Para forzarlo, añade al final |fecha (o |nofecha para que no cuente).
+   - No pongas la barra | dentro de los textos. Las líneas que empiezan por # no cuentan.
+
+
+3. temas.txt (opcional)
+     NOMBRE = Mi temario              sale arriba en el menú y en la consola
+     [PRIMERA PARTE]                  empieza un grupo (en el menú, con letra grande roja)
+     T1 = 1. Tema 1 - Geografía       un tema: CLAVE = título
+     T2, Historia = 2. Tema 2 - Historia     varias claves para el mismo tema
+
+   Las preguntas cuyo bloque empieza por la clave van a ese tema ("T1 Geografía" va a T1).
+   Los temas sin preguntas salen en gris ("sin preguntas"). Los bloques que no son de ningún
+   tema salen al final, en OTROS. Sin temas.txt, cada bloque sale como un tema.
+
+
+4. temario.txt (opcional): lo que se lee con la tecla T (TOMO DEL TEMARIO)
+     # TEMA 1 - GEOGRAFÍA        parte (título grande)
+     ## 1.1 CAPITALES            apartado
+     ### Europa                  subapartado
+     - texto                     viñeta
+     ! texto                     aviso (sale en rojo)
+     cualquier otra línea        texto normal
+
+
+5. LO QUE HAY QUE SABER
+   - Tu progreso (lo que dominas, los repasos de cada día) se guarda por pregunta, así que
+     puedes cambiar de temario y al volver sigue ahí. Si cambias el texto de una pregunta o de
+     su respuesta correcta, para el juego es una pregunta nueva.
+   - En partidas online y PvP todos tienen que elegir el MISMO temario, con los mismos archivos.
+   - Un temario también puede ir comprimido: mete la carpeta estudio en un .zip, cámbiale la
+     extensión a .pk3 y ponlo aquí, en Temarios. Así es más fácil pasárselo a otra persona.
+   - Si no hay ningún temario, el juego funciona igual pero solo sale una pregunta que avisa
+     de dónde se ponen.

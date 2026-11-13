@@ -1,0 +1,19 @@
+# PREGUNTAS DEL TEMARIO. Una pregunta por línea, con los campos separados por |
+#
+#   bloque|pregunta|respuesta correcta|incorrecta 1|incorrecta 2|incorrecta 3|explicación
+#
+# - bloque: empieza por la clave de su tema (mira temas.txt). "T1 Geografía" va al tema T1.
+# - La correcta va SIEMPRE en el tercer campo: el juego baraja las opciones.
+# - "Todas son correctas" o "Ninguna es correcta" se colocan solas al final.
+# - Si las opciones se refieren unas a otras ("Las respuestas a) y b)..."), añade al final |fijo:N
+#   y las opciones salen en el orden escrito, con la correcta en la posición N.
+# - Las preguntas de fechas (con un año o un mes en la respuesta) salen solas en SOLO FECHAS.
+#   Para forzarlo, añade al final |fecha (o |nofecha para quitarla).
+# - No uses el carácter | dentro de los textos. Las líneas que empiezan por # no cuentan.
+# - Guarda el archivo en UTF-8 (Bloc de notas: Guardar como > Codificación: UTF-8) para que salgan las tildes.
+#
+T1 Geografía|Geografía. ¿Cuál es la capital de Portugal?|Lisboa|Oporto|Coímbra|Braga|Lisboa es la capital y la ciudad más poblada de Portugal.
+T1 Geografía|Geografía. ¿Cuál es el pico más alto de España?|El Teide|El Mulhacén|El Aneto|El Veleta|El Teide (Tenerife) mide 3.715 m. El Mulhacén es el más alto de la península.
+T1 Geografía|Geografía. ¿Qué ríos de esta lista pasan por España?|Las respuestas a) y b) son correctas|El Ebro|El Duero|El Danubio|El Ebro y el Duero pasan por España; el Danubio, por Europa central.|fijo:4
+T2 Historia|Historia. ¿En qué año llegó Colón a América?|1492|1488|1500|1512|Colón llegó a América el 12 de octubre de 1492.
+T2 Historia|Historia. ¿En qué año terminó la Segunda Guerra Mundial?|1945|1944|1946|1939|La guerra empezó en 1939 y terminó en 1945.

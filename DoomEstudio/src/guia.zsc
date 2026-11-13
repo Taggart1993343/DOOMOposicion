@@ -1,0 +1,2093 @@
+// ============================================================
+//  GUIA DE NAVEGACION (como la "Navigation Guide" de Boltgun)
+//
+//  Pulsa N y aparece un rastro de balizas que te lleva al
+//  siguiente objetivo: la llave que te falta, la puerta que
+//  abre esa llave, el interruptor que abre el paso, el
+//  teletransporte o el jefe que hay que matar... y, cuando ya
+//  está todo abierto, la salida.
+//  Se recalcula solo mientras está activa.
+//
+//  Funciona leyendo la geometría del mapa (sectores, alturas,
+//  puertas, ascensores, interruptores y teletransportes), así
+//  que vale para los niveles originales de DOOM y DOOM II y
+//  para casi cualquier WAD normal.
+// ============================================================
+
+class GCNav play
+{
+	// Objetivo que marca la guía
+	enum EObj
+	{
+		OBJ_NONE,
+		OBJ_EXIT,        // salida normal
+		OBJ_SECRET,      // salida secreta (solo si no se puede llegar a la normal)
+		OBJ_SWITCH,      // pulsar el interruptor que abre el camino
+		OBJ_WALK,        // pasar por una zona que abre el camino
+		OBJ_SHOOT,       // disparar a un interruptor
+		OBJ_KILL,        // matar a los jefes (niveles que terminan así)
+		OBJ_KEY,         // coger una llave que hace falta
+		OBJ_LOCKED       // abrir la puerta (o pulsar el interruptor) de una llave que ya tienes
+	}
+	// Lo que hay que hacer en cada paso del camino
+	enum EAct
+	{
+		A_NONE,
+		A_DOOR,          // puerta con pregunta (E)
+		A_USE,           // interruptor (E)
+		A_CROSS,         // pasar por una línea
+		A_SHOOT,         // disparar a la pared
+		A_LIFT,          // ascensor (E y subir)
+		A_TELE,          // teletransporte
+		A_REMOTE         // solo en el cálculo optimista: se abre desde otro sitio
+	}
+	// Qué le puede pasar a un sector si alguien activa su disparador
+	enum EOp { OP_NONE, OP_MOVER, OP_LIFT, OP_DOOR }
+
+	const PH = 56.0;      // altura del jugador
+	const STEPH = 24.0;   // escalón máximo que se sube andando
+
+	// ---- datos fijos del nivel ----
+	int nL, nS, nT;
+	Array<double> mx, my;           // punto medio de cada línea
+	Array<int> cs, cl;              // líneas por las que se puede pasar, por sector (CSR)
+	Array<double> tdx, tdy;         // destinos de teletransporte
+	Array<int> tds, tdtid;
+
+	// ---- datos que cambian (se rehacen en cada cálculo) ----
+	Array<double> f0, c0, f1, c1;   // suelo y techo delante (0) y detrás (1) de cada línea
+	Array<int> op, hz;              // operación posible y si hace daño, por sector
+	Array<double> dtop;             // altura de una puerta abierta
+	Array<int> ts, tl;              // disparadores de cada sector (CSR)
+	Array<int> tele;                // destino de cada línea de teletransporte (-1 = no lo es)
+	Array<int> forbid;              // sectores que estamos intentando abrir (no se puede pasar por ellos para llegar a su propio interruptor)
+
+	// ---- objetivos de la búsqueda ----
+	Array<int> gs, gk, gl;          // sector, tipo de objetivo, línea
+	Array<double> gx, gy, gp;       // punto y penalización
+	Array<int> gc;                  // color de la llave de cada objetivo (1 roja, 2 azul, 4 amarilla, 8 otra)
+	int bestGoal;
+	bool bossGoals;
+	PlayerPawn who;                 // jugador para el que se calcula (qué llaves tiene)
+	int lastNeed;                   // llaves que pedía el camino a la salida en el último cálculo
+	bool assumeKeys;                // calcular como si tuviera todas las llaves
+
+	// ---- búsqueda (Dijkstra sobre las líneas del mapa) ----
+	double sx, sy, sz;
+	int ssec;
+	Array<double> dist;
+	Array<int> prv, pact, pln, done;
+	Array<double> hk;
+	Array<int> hv;
+	double popKey;
+
+	// ---- rodeos dentro de una sala (columnas, bloques, esquinas) ----
+	Array<int> rsec;                 // sector de cada tramo de la ruta que se está montando
+	Array<int> ckSec;                // caché: sector, extremos y puntos del rodeo
+	Array<double> ckA, ckB;
+	Array<int> ckStart, ckLen;
+	Array<double> ckPts;
+	int refineCount;
+	bool dbg;                        // solo para pruebas
+	Array<double> obx, oby, obr;     // objetos sólidos (barriles, lámparas, columnas...)
+	Array<int> obs;
+	Array<int> wall0, wall1;         // ¿la línea es pared vista desde delante (0) / desde detrás (1)?
+	Array<int> segFrom, segTo;       // nodos de la búsqueda a los que corresponde cada tramo de la ruta
+	int failU, failV;                // primer tramo que no se puede recorrer (no cabe el jugador)
+	int emittedKind;                 // tipo de objetivo de la última ruta montada
+	String dbgSeg;
+	const CG = 8.0;                  // tamaño de celda de la rejilla en salas normales
+	// Zonas de una sala separadas por rejas o huecos por los que no cabe el jugador
+	Array<int> compN;                // nº de zonas del sector (-1 = sin calcular, 0/1 = todo conectado)
+	Array<int> compSig;              // firma de las paredes con la que se calculó
+	Array<int> lmask0, lmask1;       // zonas que toca cada línea por delante / por detrás (bits)
+	Array<int> cgS, cgW, cgH;        // rejillas guardadas: sector, ancho, alto
+	Array<double> cgX, cgY;          // origen de cada rejilla
+	Array<double> cgG;               // tamaño de celda de cada rejilla (8 en salas normales, más en las enormes)
+	Array<int> cgStart;              // dónde empieza en cgCell
+	Array<int> cgCell;               // zona de cada celda (-2 = no se cabe)
+	int failSec;                     // sector del primer tramo imposible
+	int startMask;                   // zona de la sala donde está el jugador
+	Array<int> moving;               // sectores que se están moviendo ahora (puerta abriéndose...)
+
+	// ======================= preparación =======================
+
+	static bool IsDoorSpecial(int sp)
+	{
+		return sp == 11 || sp == 12 || sp == 13 || sp == 14 || sp == 202 || sp == 249;
+	}
+
+	static int OpKind(int sp)
+	{
+		switch (sp)
+		{
+		// puertas
+		case 11: case 12: case 13: case 14: case 202: case 249:
+			return OP_DOOR;
+		// ascensores que bajan y vuelven a subir
+		case 60: case 62: case 64: case 172: case 203: case 206: case 207:
+			return OP_LIFT;
+		// suelos, techos que suben, escaleras, puentes y plataformas
+		case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27:
+		case 31: case 32: case 35: case 36: case 37: case 41: case 47: case 63:
+		case 65: case 66: case 67: case 68: case 69: case 200: case 201: case 204:
+		case 217: case 228: case 230: case 231: case 238: case 239: case 240:
+		case 241: case 242: case 245: case 246: case 247: case 250: case 251:
+		case 252: case 256: case 257: case 258: case 270: case 271: case 272: case 273:
+			return OP_MOVER;
+		}
+		return OP_NONE;
+	}
+
+	static bool IsStairs(int sp)
+	{
+		return sp == 26 || sp == 27 || sp == 31 || sp == 32 || sp == 204 || (sp >= 270 && sp <= 273) || sp == 217;
+	}
+
+	static bool HasTag(Sector s, int tag)
+	{
+		for (int i = 0; i < s.CountTags(); i++) if (s.GetTag(i) == tag) return true;
+		return false;
+	}
+
+	static double Len2D(double ax, double ay, double bx, double by)
+	{
+		return sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by));
+	}
+
+	void Init()
+	{
+		nL = level.Lines.Size();
+		nS = level.Sectors.Size();
+		mx.Resize(nL);
+		my.Resize(nL);
+		for (int i = 0; i < nL; i++)
+		{
+			Line l = level.Lines[i];
+			mx[i] = (l.v1.p.x + l.v2.p.x) / 2;
+			my[i] = (l.v1.p.y + l.v2.p.y) / 2;
+		}
+
+		// Para cada sector, las líneas por las que se puede salir de él
+		cs.Resize(nS + 1);
+		for (int i = 0; i <= nS; i++) cs[i] = 0;
+		for (int i = 0; i < nL; i++)
+		{
+			Line l = level.Lines[i];
+			if (!Usable2(l)) continue;
+			int a = l.frontsector.Index();
+			cs[a + 1]++;
+			if (l.backsector && l.backsector.Index() != a) cs[l.backsector.Index() + 1]++;
+		}
+		for (int i = 0; i < nS; i++) cs[i + 1] += cs[i];
+		cl.Resize(cs[nS]);
+		Array<int> fill;
+		fill.Copy(cs);
+		for (int i = 0; i < nL; i++)
+		{
+			Line l = level.Lines[i];
+			if (!Usable2(l)) continue;
+			int a = l.frontsector.Index();
+			cl[fill[a]] = i;
+			fill[a]++;
+			if (l.backsector && l.backsector.Index() != a)
+			{
+				int b = l.backsector.Index();
+				cl[fill[b]] = i;
+				fill[b]++;
+			}
+		}
+
+		// Destinos de teletransporte
+		tdx.Clear(); tdy.Clear(); tds.Clear(); tdtid.Clear();
+		let it = ThinkerIterator.Create("TeleportDest");
+		Actor a;
+		while (a = Actor(it.Next()))
+		{
+			if (!a.CurSector) continue;
+			tdx.Push(a.pos.x);
+			tdy.Push(a.pos.y);
+			tds.Push(a.CurSector.Index());
+			tdtid.Push(a.tid);
+		}
+		nT = tdx.Size();
+
+		ckSec.Clear(); ckA.Clear(); ckB.Clear(); ckStart.Clear(); ckLen.Clear(); ckPts.Clear();
+		int n = 2 * nL + nT + 2;
+		compN.Resize(nS); compSig.Resize(nS);
+		for (int i = 0; i < nS; i++) { compN[i] = -1; compSig[i] = 0; }
+		lmask0.Resize(nL); lmask1.Resize(nL);
+		for (int i = 0; i < nL; i++) { lmask0[i] = 0; lmask1[i] = 0; }
+		cgS.Clear(); cgW.Clear(); cgH.Clear(); cgX.Clear(); cgY.Clear(); cgG.Clear(); cgStart.Clear(); cgCell.Clear();
+		dist.Resize(n);
+		prv.Resize(n);
+		pact.Resize(n);
+		pln.Resize(n);
+		done.Resize(n);
+	}
+
+	static bool Usable2(Line l)
+	{
+		if (!l.frontsector) return false;
+		return l.backsector || l.special == 70 || l.special == 71;
+	}
+
+	// Estado actual del mapa: alturas, qué se puede abrir y con qué
+	void Prepare()
+	{
+		f0.Resize(nL); c0.Resize(nL); f1.Resize(nL); c1.Resize(nL);
+		tele.Resize(nL);
+		for (int i = 0; i < nL; i++)
+		{
+			Line l = level.Lines[i];
+			Vector2 m = (mx[i], my[i]);
+			f0[i] = l.frontsector.floorplane.ZatPoint(m);
+			c0[i] = l.frontsector.ceilingplane.ZatPoint(m);
+			if (l.backsector)
+			{
+				f1[i] = l.backsector.floorplane.ZatPoint(m);
+				c1[i] = l.backsector.ceilingplane.ZatPoint(m);
+			}
+			else
+			{
+				f1[i] = f0[i];
+				c1[i] = f0[i];
+			}
+			tele[i] = -1;
+			if ((l.special == 70 || l.special == 71) && (l.activation & (SPAC_Cross | SPAC_AnyCross)))
+				tele[i] = FindDest(l);
+		}
+		// Paredes para el jugador: una cara, bloqueantes o que no se pueden cruzar ahora
+		wall0.Resize(nL); wall1.Resize(nL);
+		for (int i = 0; i < nL; i++)
+		{
+			Line l = level.Lines[i];
+			bool blk = (l.flags & (Line.ML_BLOCKING | Line.ML_BLOCK_PLAYERS | Line.ML_BLOCKEVERYTHING)) != 0;
+			if (!l.backsector || blk) { wall0[i] = 1; wall1[i] = 1; continue; }
+			if (l.frontsector.Index() == l.backsector.Index()) { wall0[i] = 0; wall1[i] = 0; continue; }
+			wall0[i] = Fits(f0[i], c0[i], f1[i], c1[i]) ? 0 : 1;
+			wall1[i] = Fits(f1[i], c1[i], f0[i], c0[i]) ? 0 : 1;
+		}
+		// Si han cambiado las paredes de una sala con zonas calculadas (una reja que baja...), se recalcula
+		for (int k = 0; k < cgS.Size(); k++)
+		{
+			int cs3 = cgS[k];
+			if (compN[cs3] >= 0 && WallSig(cs3) != compSig[cs3]) Components(cs3);
+		}
+
+		// Objetos sólidos que cortan el paso (para que el rastro los rodee)
+		obx.Clear(); oby.Clear(); obr.Clear(); obs.Clear();
+		let oit = ThinkerIterator.Create("Actor");
+		Actor ob;
+		while (ob = Actor(oit.Next()))
+		{
+			if (!ob.bSOLID || ob.bIsMonster || ob.player || ob is "Inventory" || !ob.CurSector) continue;
+			if (ob.radius < 4 || ob.height < 24 || ob.bNOBLOCKMAP) continue;
+			obx.Push(ob.pos.x); oby.Push(ob.pos.y); obr.Push(ob.radius); obs.Push(ob.CurSector.Index());
+		}
+
+		op.Resize(nS); hz.Resize(nS); dtop.Resize(nS); forbid.Resize(nS);
+		for (int i = 0; i < nS; i++)
+		{
+			op[i] = OP_NONE;
+			forbid[i] = 0;
+			hz[i] = (level.Sectors[i].damageamount > 0) ? 1 : 0;
+			dtop[i] = 0;
+		}
+
+		// Pares (disparador, sector afectado)
+		Array<int> pl, psec;
+		for (int i = 0; i < nL; i++)
+		{
+			Line l = level.Lines[i];
+			if (!l.special || !(l.activation & SPAC_PlayerActivate)) continue;
+			int k = OpKind(l.special);
+			if (k == OP_NONE) continue;
+			int n0 = psec.Size();
+			int tag = l.args[0];
+			if (tag == 0)
+			{
+				if (l.backsector) { pl.Push(i); psec.Push(l.backsector.Index()); }
+			}
+			else
+			{
+				let it = level.CreateSectorTagIterator(tag);
+				int s;
+				while ((s = it.Next()) >= 0) { pl.Push(i); psec.Push(s); }
+			}
+			if (IsStairs(l.special))
+			{
+				int n1 = psec.Size();
+				for (int j = n0; j < n1; j++) AddStairs(i, psec[j], pl, psec);
+			}
+			for (int j = n0; j < psec.Size(); j++)
+				if (op[psec[j]] < k) op[psec[j]] = k;
+		}
+
+		// Lo que ya se está moviendo (una puerta abriéndose tras pulsar su interruptor) cuenta como "se abre solo"
+		moving.Resize(nS);
+		for (int i = 0; i < nS; i++)
+		{
+			Sector sm = level.Sectors[i];
+			moving[i] = (sm.floordata || sm.ceilingdata) ? 1 : 0;
+			if (moving[i] && op[i] == OP_NONE) op[i] = OP_MOVER;
+		}
+
+		// Altura de cada puerta abierta: el techo más bajo de alrededor - 4
+		for (int i = 0; i < nS; i++)
+		{
+			if (op[i] != OP_DOOR) continue;
+			Sector s = level.Sectors[i];
+			double low = 1e9;
+			for (int k = 0; k < s.lines.Size(); k++)
+			{
+				Line l = s.lines[k];
+				if (!l.backsector) continue;
+				int li = l.Index();
+				double c = (l.frontsector.Index() == i) ? c1[li] : c0[li];
+				if (c < low) low = c;
+			}
+			dtop[i] = (low < 1e8) ? low - 4 : s.ceilingplane.ZatPoint(s.centerspot);
+		}
+
+		// Disparadores agrupados por sector
+		ts.Resize(nS + 1);
+		for (int i = 0; i <= nS; i++) ts[i] = 0;
+		for (int j = 0; j < psec.Size(); j++) ts[psec[j] + 1]++;
+		for (int i = 0; i < nS; i++) ts[i + 1] += ts[i];
+		tl.Resize(psec.Size());
+		Array<int> fill;
+		fill.Copy(ts);
+		for (int j = 0; j < psec.Size(); j++)
+		{
+			int s = psec[j];
+			tl[fill[s]] = pl[j];
+			fill[s]++;
+		}
+	}
+
+	// Las escaleras que se construyen solas: siguen por los sectores con el mismo suelo
+	void AddStairs(int li, int s0, out Array<int> pl, out Array<int> psec)
+	{
+		TextureID tex = level.Sectors[s0].GetTexture(Sector.floor);
+		int cur = s0;
+		Array<int> seen;
+		seen.Push(s0);
+		for (int n = 0; n < 64; n++)
+		{
+			Sector c = level.Sectors[cur];
+			int nx = -1;
+			for (int k = 0; k < c.lines.Size(); k++)
+			{
+				Line l = c.lines[k];
+				if (!l.backsector || l.frontsector.Index() != cur) continue;
+				int b = l.backsector.Index();
+				if (seen.Find(b) != seen.Size()) continue;
+				if (l.backsector.GetTexture(Sector.floor) != tex) continue;
+				nx = b;
+				break;
+			}
+			if (nx < 0) break;
+			seen.Push(nx);
+			pl.Push(li);
+			psec.Push(nx);
+			cur = nx;
+		}
+	}
+
+	int FindDest(Line l)
+	{
+		int tid = l.args[0];
+		int tag = (l.special == 70) ? l.args[1] : l.args[2];
+		for (int k = 0; k < nT; k++)
+		{
+			if (tid != 0 && tdtid[k] != tid) continue;
+			if (tag != 0 && !HasTag(level.Sectors[tds[k]], tag)) continue;
+			return k;
+		}
+		return -1;
+	}
+
+	// ======================= reglas de paso =======================
+
+	static bool Fits(double fa, double ca, double fb, double cb)
+	{
+		return min(ca, cb) - max(fa, fb) >= PH && fb - fa <= STEPH;
+	}
+
+	// ¿Se podría pasar si se abre / se mueve el sector de origen (ra), el de destino (rb) o los dos?
+	bool Feasible(int ci, int oi, bool ra, bool rb, double fa, double ca, double fb, double cb)
+	{
+		bool flexA = false, flexB = false;
+		if (ra) { if (op[ci] == OP_DOOR) ca = max(ca, dtop[ci]); else flexA = true; }
+		if (rb) { if (op[oi] == OP_DOOR) cb = max(cb, dtop[oi]); else flexB = true; }
+		if (!flexA && !flexB) return Fits(fa, ca, fb, cb);
+		// un suelo o plataforma que se mueve se pone a la altura que haga falta:
+		// basta con que el otro lado tenga sitio
+		return (flexA || ca - fa >= PH) && (flexB || cb - fb >= PH);
+	}
+
+	// ¿Desde el sector ci se llega a pulsar la línea t? De frente, o desde la sala de al lado
+	// si el interruptor está en un hueco de la pared en el que no se cabe (se pulsa desde 64 unidades)
+	bool CanUseFrom(int t, int ci, bool back)
+	{
+		Line l = level.Lines[t];
+		Sector f = back ? l.backsector : l.frontsector;
+		if (!f) return false;
+		int fi = f.Index();
+		if (fi == ci) return true;
+		Vector2 m = (mx[t], my[t]);
+		for (int k = 0; k < f.lines.Size(); k++)
+		{
+			Line b = f.lines[k];
+			if (!b.backsector) continue;
+			int o = (b.frontsector.Index() == fi) ? b.backsector.Index() : b.frontsector.Index();
+			if (o != ci) continue;
+			if (PtSeg(m, b.v1.p, b.v2.p) < 56) return true;
+		}
+		return false;
+	}
+
+	// ¿El jugador puede activar la línea t estando en el sector ci?
+	bool CanTrigger(int t, int ci)
+	{
+		Line l = level.Lines[t];
+		if (!HasLock(LockOf(l))) return false;      // puerta o interruptor de una llave que no tienes
+		int a = l.activation;
+		int fs = l.frontsector ? l.frontsector.Index() : -1;
+		int bs = l.backsector ? l.backsector.Index() : -1;
+		if ((a & (SPAC_Use | SPAC_UseThrough | SPAC_Push | SPAC_Impact)) && CanUseFrom(t, ci, false)) return true;
+		if ((a & SPAC_UseBack) && CanUseFrom(t, ci, true)) return true;
+		if ((a & (SPAC_Cross | SPAC_AnyCross)) && (fs == ci || bs == ci)) return true;
+		return false;
+	}
+
+	int FindTrig(int x, int ci)
+	{
+		for (int k = ts[x]; k < ts[x + 1]; k++)
+			if (CanTrigger(tl[k], ci)) return tl[k];
+		return -1;
+	}
+
+	int ActOf(int t, int x)
+	{
+		Line l = level.Lines[t];
+		bool use = (l.activation & (SPAC_Use | SPAC_UseThrough | SPAC_Push | SPAC_UseBack)) != 0;
+		bool crs = (l.activation & (SPAC_Cross | SPAC_AnyCross)) != 0;
+		if (use && op[x] == OP_DOOR && IsDoorSpecial(l.special)) return A_DOOR;
+		if (op[x] == OP_LIFT && (use || crs)) return A_LIFT;
+		if (use) return A_USE;
+		if (crs) return A_CROSS;
+		return A_SHOOT;
+	}
+
+	// Disparador para abrir/mover el sector x estando en ci
+	bool, int, int, double Need(int x, int ci, int mode, double mxl, double myl)
+	{
+		if (moving[x]) return true, A_NONE, -1, 64;     // ya se está abriendo: basta con esperar
+		int t = FindTrig(x, ci);
+		if (t >= 0)
+		{
+			int a = ActOf(t, x);
+			return true, a, t, (a == A_DOOR ? 96 : 48) + 2 * Len2D(mxl, myl, mx[t], my[t]);
+		}
+		if (mode == 1 && AnyUsableTrig(x)) return true, A_REMOTE, x, 2048;
+		return false, A_NONE, -1, 0;
+	}
+
+	// Cruzar la línea li desde el sector ci al oi.
+	// mode 0 = lo que se puede hacer ya; mode 1 = suponiendo que se abre todo lo que tiene disparador.
+	bool, double, int, int CrossLine(int li, bool fromFront, int ci, int oi, int mode)
+	{
+		Line l = level.Lines[li];
+		if (l.flags & (Line.ML_BLOCKING | Line.ML_BLOCK_PLAYERS | Line.ML_BLOCKEVERYTHING)) return false, 0, A_NONE, -1;
+		double fa, ca, fb, cb;
+		if (fromFront) { fa = f0[li]; ca = c0[li]; fb = f1[li]; cb = c1[li]; }
+		else { fa = f1[li]; ca = c1[li]; fb = f0[li]; cb = c0[li]; }
+		double pen = hz[oi] ? 320 : 0;      // evita el ácido si hay otro camino
+		if (Fits(fa, ca, fb, cb)) return true, pen, A_NONE, -1;
+
+		bool opA = op[ci] != OP_NONE && !forbid[ci];
+		bool opB = op[oi] != OP_NONE && !forbid[oi];
+		// salir de algo que hubo que abrir para entrar (puerta cerrada, suelo movido) o de un ascensor: sin disparador
+		bool freeA = opA && (op[ci] == OP_LIFT || ca - fa < PH);
+		for (int set = 1; set <= 3; set++)       // 1 = se mueve el destino, 2 = el origen, 3 = los dos
+		{
+			bool ra = (set & 2) != 0;
+			bool rb = (set & 1) != 0;
+			if ((ra && !opA) || (rb && !opB)) continue;
+			if (!Feasible(ci, oi, ra, rb, fa, ca, fb, cb)) continue;
+			bool ok = true;
+			int act = A_NONE, aline = -1;
+			double extra = 0;
+			if (rb)
+			{
+				bool k; int a, al; double ex;
+				[k, a, al, ex] = Need(oi, ci, mode, mx[li], my[li]);
+				if (!k) continue;
+				act = a; aline = al; extra += ex;
+			}
+			if (ra && !freeA)
+			{
+				bool k; int a, al; double ex;
+				[k, a, al, ex] = Need(ci, ci, mode, mx[li], my[li]);
+				if (!k) continue;
+				if (act == A_NONE || a == A_REMOTE) { act = a; aline = al; }
+				extra += ex;
+			}
+			return true, pen + extra, act, aline;
+		}
+		return false, 0, A_NONE, -1;
+	}
+
+	// ======================= búsqueda =======================
+
+	void HPush(double k, int v)
+	{
+		hk.Push(k);
+		hv.Push(v);
+		int i = hk.Size() - 1;
+		while (i > 0)
+		{
+			int p = (i - 1) >> 1;
+			if (hk[p] <= hk[i]) break;
+			double tk = hk[p]; hk[p] = hk[i]; hk[i] = tk;
+			int tv = hv[p]; hv[p] = hv[i]; hv[i] = tv;
+			i = p;
+		}
+	}
+
+	int HPop()
+	{
+		int v = hv[0];
+		popKey = hk[0];
+		int last = hk.Size() - 1;
+		hk[0] = hk[last];
+		hv[0] = hv[last];
+		hk.Pop();
+		hv.Pop();
+		int n = hk.Size();
+		int i = 0;
+		while (true)
+		{
+			int l = 2 * i + 1;
+			if (l >= n) break;
+			int r = l + 1;
+			int m = (r < n && hk[r] < hk[l]) ? r : l;
+			if (hk[i] <= hk[m]) break;
+			double tk = hk[m]; hk[m] = hk[i]; hk[i] = tk;
+			int tv = hv[m]; hv[m] = hv[i]; hv[i] = tv;
+			i = m;
+		}
+		return v;
+	}
+
+	void Relax(int v, double nd, int from, int act, int aline)
+	{
+		if (nd >= dist[v]) return;
+		dist[v] = nd;
+		prv[v] = from;
+		pact[v] = act;
+		pln[v] = aline;
+		HPush(nd, v);
+	}
+
+	int, double, double NodeInfo(int n)
+	{
+		if (n < 2 * nL)
+		{
+			int li = n >> 1;
+			Line l = level.Lines[li];
+			int s;
+			if (n & 1) s = l.backsector.Index(); else s = l.frontsector.Index();
+			return s, mx[li], my[li];
+		}
+		n -= 2 * nL;
+		if (n < nT) return tds[n], tdx[n], tdy[n];
+		if (n == nT) return ssec, sx, sy;
+		return -1, 0, 0;
+	}
+
+	bool Run(int mode)
+	{
+		int n = 2 * nL + nT + 2;
+		int SN = n - 2;
+		int GN = n - 1;
+		for (int i = 0; i < n; i++)
+		{
+			dist[i] = 1e30;
+			prv[i] = -1;
+			pact[i] = A_NONE;
+			pln[i] = -1;
+			done[i] = 0;
+		}
+		hk.Clear();
+		hv.Clear();
+		bestGoal = -1;
+		if (gs.Size() == 0) return false;
+		dist[SN] = 0;
+		HPush(0, SN);
+		while (hk.Size() > 0)
+		{
+			int u = HPop();
+			double d = popKey;
+			if (done[u]) continue;
+			done[u] = 1;
+			if (u == GN) return true;
+			int sec;
+			double px, py;
+			[sec, px, py] = NodeInfo(u);
+			if (sec < 0) continue;
+
+			// zona de la sala en la que está este nodo (si la sala está partida)
+			int um = 0;
+			if (compN[sec] > 1)
+			{
+				if (u < 2 * nL) um = ((u & 1) ? lmask1[u >> 1] : lmask0[u >> 1]);
+				else if (u - 2 * nL < nT) um = PointMask(tdx[u - 2 * nL], tdy[u - 2 * nL], sec);
+				else um = startMask;
+				if (um == ISO) continue;            // se entra por un hueco en el que no se cabe: sin salida
+			}
+			for (int g = 0; g < gs.Size(); g++)
+			{
+				if (gs[g] != sec) continue;
+				if (um && !(PointMask(gx[g], gy[g], sec) & um)) continue;
+				double nd = d + Len2D(px, py, gx[g], gy[g]) + gp[g];
+				if (nd < dist[GN])
+				{
+					dist[GN] = nd;
+					prv[GN] = u;
+					pact[GN] = A_NONE;
+					pln[GN] = -1;
+					bestGoal = g;
+					HPush(nd, GN);
+				}
+			}
+
+			for (int k = cs[sec]; k < cs[sec + 1]; k++)
+			{
+				int li = cl[k];
+				Line l = level.Lines[li];
+				bool fromFront = l.frontsector.Index() == sec;
+				double c = d + Len2D(px, py, mx[li], my[li]);
+				if (um)
+				{
+					int lm = fromFront ? lmask0[li] : lmask1[li];
+					if (lm && !(lm & um)) continue;          // al otro lado de la reja
+				}
+				if (tele[li] >= 0 && fromFront)
+				{
+					// el teletransporte solo salta si de verdad se puede pisar la línea (altura, hueco)
+					bool tok = true;
+					double tex = 0;
+					int ta = A_NONE, tal = -1;
+					if (l.backsector && l.backsector.Index() != sec)
+						[tok, tex, ta, tal] = CrossLine(li, true, sec, l.backsector.Index(), mode);
+					// si para pisarlo hay que abrir algo desde otro sitio, eso es lo que cuenta (modo optimista)
+					if (tok) Relax(2 * nL + tele[li], c + 16 + tex, u, ta == A_REMOTE ? A_REMOTE : A_TELE, ta == A_REMOTE ? tal : li);
+					continue;
+				}
+				if (!l.backsector) continue;
+				int oth = fromFront ? l.backsector.Index() : l.frontsector.Index();
+				if (oth == sec) continue;
+				bool ok;
+				double ex;
+				int a, al;
+				[ok, ex, a, al] = CrossLine(li, fromFront, sec, oth, mode);
+				if (ok) Relax(2 * li + (fromFront ? 1 : 0), c + ex, u, a, al);
+			}
+		}
+		return false;
+	}
+
+	// ---------- zonas de una sala (rejilla de 8 unidades con el ancho del jugador) ----------
+
+	int WallSig(int s)
+	{
+		Sector sec = level.Sectors[s];
+		int h = 0;
+		for (int k = 0; k < sec.lines.Size(); k++)
+		{
+			Line l = sec.lines[k];
+			if (IsWall(l, s)) h = (h * 31 + l.Index() + 7) & 0x3FFFFFFF;
+		}
+		return h;
+	}
+
+	int GridOf(int s)
+	{
+		for (int k = 0; k < cgS.Size(); k++) if (cgS[k] == s) return k;
+		return -1;
+	}
+
+	const ISO = 1 << 30;             // "por aquí no cabe el jugador": no conecta con ninguna zona
+
+	// Zona (como bit) de la celda en la que cae un punto; busca la libre más cercana si cae pegado a la pared.
+	// strict: para las líneas, solo se mira muy cerca (si no, se "saltaría" un obstáculo) y si no hay sitio, ISO
+	int PointMask(double x, double y, int s, bool strict = false)
+	{
+		if (compN[s] <= 1) return 0;
+		int k = GridOf(s);
+		if (k < 0) return 0;
+		int W = cgW[k], H = cgH[k];
+		double G = cgG[k];
+		int ci = int((x - cgX[k]) / G), cj = int((y - cgY[k]) / G);
+		int rmax = (strict && G <= CG) ? 2 : 3;
+		for (int r = 0; r <= rmax; r++)
+			for (int dj = -r; dj <= r; dj++)
+				for (int di = -r; di <= r; di++)
+				{
+					if (max(abs(di), abs(dj)) != r) continue;
+					int i = ci + di, j = cj + dj;
+					if (i < 0 || j < 0 || i >= W || j >= H) continue;
+					int c = cgCell[cgStart[k] + j * W + i];
+					if (c >= 0) return 1 << min(c, 29);
+				}
+		return strict ? ISO : 0;
+	}
+
+	void Components(int s)
+	{
+		Sector sec = level.Sectors[s];
+		compSig[s] = WallSig(s);
+		double x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+		for (int k = 0; k < sec.lines.Size(); k++)
+		{
+			Line l = sec.lines[k];
+			x0 = min(x0, min(l.v1.p.x, l.v2.p.x)); x1 = max(x1, max(l.v1.p.x, l.v2.p.x));
+			y0 = min(y0, min(l.v1.p.y, l.v2.p.y)); y1 = max(y1, max(l.v1.p.y, l.v2.p.y));
+		}
+		// celdas de 8 unidades; en sectores enormes (a veces el mismo sector está en dos sitios
+		// distintos del mapa) las celdas son más grandes: así al menos se separan las zonas sueltas
+		double G = CG;
+		while (int((x1 - x0) / G + 1) * int((y1 - y0) / G + 1) > 24000) G *= 2;
+		int W = int((x1 - x0) / G) + 1, H = int((y1 - y0) / G) + 1;
+		if (sec.lines.Size() > 700) { compN[s] = 0; return; }   // demasiado complejo: se supone todo conectado
+		double clr = (G <= CG) ? 15.5 : 2;          // con celdas grandes solo se mira que la celda esté dentro
+		int k = GridOf(s);
+		if (k >= 0)
+		{
+			// se rehace desde cero (el tamaño no cambia: es el mismo sector)
+			cgX[k] = x0; cgY[k] = y0;
+		}
+		else
+		{
+			k = cgS.Size();
+			cgS.Push(s); cgW.Push(W); cgH.Push(H); cgX.Push(x0); cgY.Push(y0); cgG.Push(G);
+			cgStart.Push(cgCell.Size());
+			for (int i = 0; i < W * H; i++) cgCell.Push(-2);
+		}
+		int base = cgStart[k];
+		for (int j = 0; j < H; j++)
+			for (int i = 0; i < W; i++)
+			{
+				Vector2 c = (x0 + (i + 0.5) * G, y0 + (j + 0.5) * G);
+				Sector cs2 = level.PointInSector(c);
+				bool free = cs2 && cs2.Index() == s && Clear(c, s, clr);
+				cgCell[base + j * W + i] = free ? -1 : -2;
+			}
+		// relleno por inundación
+		int nc = 0;
+		Array<int> stack;
+		for (int st = 0; st < W * H; st++)
+		{
+			if (cgCell[base + st] != -1) continue;
+			stack.Clear();
+			stack.Push(st);
+			cgCell[base + st] = nc;
+			while (stack.Size() > 0)
+			{
+				int c = stack[stack.Size() - 1];
+				stack.Pop();
+				int ci = c % W, cj = c / W;
+				for (int d = 0; d < 4; d++)
+				{
+					int ni = ci + (d == 0 ? 1 : d == 1 ? -1 : 0);
+					int nj = cj + (d == 2 ? 1 : d == 3 ? -1 : 0);
+					if (ni < 0 || nj < 0 || ni >= W || nj >= H) continue;
+					int nidx = nj * W + ni;
+					if (cgCell[base + nidx] != -1) continue;
+					cgCell[base + nidx] = nc;
+					stack.Push(nidx);
+				}
+			}
+			nc++;
+		}
+		compN[s] = nc;
+		// zonas que toca cada línea por el lado de este sector
+		for (int kk = 0; kk < sec.lines.Size(); kk++)
+		{
+			Line l = sec.lines[kk];
+			int li = l.Index();
+			bool front = l.frontsector.Index() == s;
+			double len = l.delta.Length();
+			int m = 0;
+			if (len >= 1)
+			{
+				Vector2 nrm = (l.delta.y, -l.delta.x) / len;
+				if (!front) nrm = -nrm;
+				int ns = clamp(int(len / 16), 3, 15);
+				for (int t = 0; t < ns; t++)
+				{
+					Vector2 pp = l.v1.p + l.delta * ((t + 0.5) / ns) + nrm * 12;
+					int pm = PointMask(pp.x, pp.y, s, true);
+					if (pm != ISO) m |= pm;
+				}
+				if (m == 0) m = ISO;        // ningún hueco por el que quepa el jugador
+			}
+			if (front) lmask0[li] = m; else lmask1[li] = m;
+			if (l.backsector && l.frontsector.Index() == l.backsector.Index()) { lmask0[li] = 0; lmask1[li] = 0; }
+		}
+	}
+
+	// Busca (modo 0) y monta la ruta. Si un tramo resulta imposible para el jugador
+	// (rejas, huecos de menos de 32 unidades...), calcula las zonas de esa sala y vuelve a buscar.
+	bool RunEmit(GCPlayerState q)
+	{
+		bool found = false;
+		for (int tries = 0; tries < 8; tries++)
+		{
+			startMask = PointMask(sx, sy, ssec);
+			if (!Run(0)) { found = false; break; }
+			emittedKind = gk[bestGoal];
+			Emit(q, emittedKind);
+			found = true;
+			if (failSec < 0 || compN[failSec] >= 0) break;     // ya sabemos cómo es esa sala: no se puede afinar más
+			if (dbg) Console.Printf("ZONES sector %d (%s)", failSec, dbgSeg);
+			Components(failSec);
+		}
+		return found;
+	}
+
+	// Sector del camino optimista que hay que abrir desde otro sitio: el primero desde donde estás.
+	// Si el objetivo que ya se estaba marcando sigue haciendo falta, se mantiene (si no, al subir y bajar
+	// un ascensor la guía saltaría de un objetivo a otro sin parar)
+	int FirstRemote(GCPlayerState q = null)
+	{
+		int n = 2 * nL + nT + 2;
+		int SN = n - 2;
+		Array<int> rem;
+		for (int v = n - 1; v >= 0 && v != SN; v = prv[v])
+			if (pact[v] == A_REMOTE) rem.Push(pln[v]);
+		if (rem.Size() == 0) return -1;
+		if (q && q.gLine >= 0 && (q.gObj == OBJ_SWITCH || q.gObj == OBJ_WALK || q.gObj == OBJ_SHOOT))
+			for (int i = 0; i < rem.Size(); i++)
+			{
+				int x = rem[i];
+				if (x < 0 || x >= nS) continue;
+				for (int k = ts[x]; k < ts[x + 1]; k++) if (tl[k] == q.gLine) return x;
+			}
+		return rem[rem.Size() - 1];
+	}
+
+	// ======================= objetivos =======================
+
+	void ClearGoals()
+	{
+		gs.Clear(); gk.Clear(); gl.Clear();
+		gx.Clear(); gy.Clear(); gp.Clear();
+		gc.Clear();
+		bossGoals = false;
+	}
+
+	void AddGoal(int s, double x, double y, int kind, int line, double pen)
+	{
+		gs.Push(s); gk.Push(kind); gl.Push(line);
+		gx.Push(x); gy.Push(y); gp.Push(pen);
+		gc.Push(0);
+	}
+
+	// Punto delante de la cara frontal de una línea
+	Vector2 FrontPoint(int li, double d)
+	{
+		Line l = level.Lines[li];
+		double len = l.delta.Length();
+		if (len < 1) return (mx[li], my[li]);
+		Vector2 n = (l.delta.y, -l.delta.x) / len;
+		return (mx[li], my[li]) + n * d;
+	}
+
+	// Dónde hay que ponerse para activar la línea li
+	Vector2 TrigPoint(int li)
+	{
+		Line l = level.Lines[li];
+		int a = l.activation;
+		if (a & (SPAC_Use | SPAC_UseThrough | SPAC_Push)) return FrontPoint(li, 24);
+		if (a & SPAC_UseBack) return FrontPoint(li, -24);
+		if (a & (SPAC_Cross | SPAC_AnyCross)) return (mx[li], my[li]);
+		return FrontPoint(li, 96);   // disparar: desde un poco más lejos
+	}
+
+	void AddLineGoal(int li, int kind)
+	{
+		Line l = level.Lines[li];
+		int a = l.activation;
+		if (a & (SPAC_Cross | SPAC_AnyCross))
+		{
+			AddGoal(l.frontsector.Index(), mx[li], my[li], kind, li, 0);
+			if (l.backsector) AddGoal(l.backsector.Index(), mx[li], my[li], kind, li, 0);
+		}
+		if (a & (SPAC_Use | SPAC_UseThrough | SPAC_Push | SPAC_Impact))
+		{
+			Vector2 p = TrigPoint(li);
+			AddGoal(l.frontsector.Index(), p.x, p.y, kind, li, 0);
+			// interruptor en un hueco: también se puede pulsar desde la sala de al lado
+			Sector f = l.frontsector;
+			int fi = f.Index();
+			Vector2 m = (mx[li], my[li]);
+			for (int k = 0; k < f.lines.Size(); k++)
+			{
+				Line b = f.lines[k];
+				if (!b.backsector) continue;
+				int o = (b.frontsector.Index() == fi) ? b.backsector.Index() : b.frontsector.Index();
+				if (o == fi || PtSeg(m, b.v1.p, b.v2.p) >= 56) continue;
+				Vector2 e = b.v2.p - b.v1.p;
+				double len2 = e dot e;
+				if (len2 < 1) continue;
+				double t = clamp(((m - b.v1.p) dot e) / len2, 0.1, 0.9);
+				Vector2 c = b.v1.p + e * t;
+				Vector2 nrm = (e.y, -e.x) / sqrt(len2);
+				if (b.frontsector.Index() != o) nrm = -nrm;     // hacia el lado de o
+				c += nrm * 20;
+				AddGoal(o, c.x, c.y, kind, li, 8);
+			}
+		}
+		if ((a & SPAC_UseBack) && l.backsector)
+		{
+			Vector2 p = FrontPoint(li, -24);
+			AddGoal(l.backsector.Index(), p.x, p.y, kind, li, 0);
+		}
+	}
+
+	void AddExitGoals(bool secret)
+	{
+		for (int i = 0; i < nL; i++)
+		{
+			Line l = level.Lines[i];
+			int sp = l.special;
+			bool isExit = (sp == 243 || sp == 74 || sp == 75);
+			if (secret ? (sp != 244) : !isExit) continue;
+			if (!(l.activation & SPAC_PlayerActivate)) continue;
+			AddLineGoal(i, secret ? OBJ_SECRET : OBJ_EXIT);
+		}
+		if (secret) return;
+		// Sectores que terminan el nivel (E1M8)
+		for (int i = 0; i < nS; i++)
+		{
+			Sector s = level.Sectors[i];
+			if (s.Flags & (Sector.SECF_ENDLEVEL | Sector.SECF_EXIT1 | Sector.SECF_EXIT2))
+				AddGoal(i, s.centerspot.x, s.centerspot.y, OBJ_EXIT, -1, 0);
+		}
+	}
+
+	void AddTriggerGoals(int x)
+	{
+		for (int k = ts[x]; k < ts[x + 1]; k++)
+		{
+			int t = tl[k];
+			Line l = level.Lines[t];
+			int lk = LockOf(l);
+			if (!HasLock(lk)) continue;               // necesita una llave que no tienes
+			int a = l.activation;
+			int kind = OBJ_SHOOT;
+			if (a & (SPAC_Use | SPAC_UseThrough | SPAC_Push | SPAC_UseBack)) kind = OBJ_SWITCH;
+			else if (a & (SPAC_Cross | SPAC_AnyCross)) kind = OBJ_WALK;
+			if (lk > 0) kind = OBJ_LOCKED;            // puerta o interruptor de una llave que ya tienes
+			int g0 = gs.Size();
+			AddLineGoal(t, kind);
+			if (lk > 0) for (int g = g0; g < gc.Size(); g++) gc[g] = LockBits(lk);
+		}
+	}
+
+	// ¿La clase del actor (o la que reemplaza, p. ej. en Brutal Doom) se llama así?
+	static bool IsKind(Actor a, Name n)
+	{
+		class<Object> c = a.GetClass();
+		while (c) { if (c.GetClassName() == n) return true; c = c.GetParentClass(); }
+		c = Actor.GetReplacee(a.GetClass());
+		while (c) { if (c.GetClassName() == n) return true; c = c.GetParentClass(); }
+		return false;
+	}
+
+	// ¿Este enemigo hay que matarlo para terminar o abrir el nivel?
+	static bool IsLevelBoss(Actor a)
+	{
+		int f = level.info.flags;
+		int f3 = level.info.flags3;
+		if ((f & LEVEL_MAP07SPECIAL) && (IsKind(a, 'Fatso') || IsKind(a, 'Arachnotron'))) return true;
+		if (((f & LEVEL_BRUISERSPECIAL) || (f3 & LEVEL3_E1M8SPECIAL)) && IsKind(a, 'BaronOfHell')) return true;
+		if (((f & LEVEL_CYBORGSPECIAL) || (f3 & (LEVEL3_E2M8SPECIAL | LEVEL3_E4M6SPECIAL))) && IsKind(a, 'Cyberdemon')) return true;
+		if (((f & LEVEL_SPIDERSPECIAL) || (f3 & (LEVEL3_E3M8SPECIAL | LEVEL3_E4M8SPECIAL))) && IsKind(a, 'SpiderMastermind')) return true;
+		return IsKind(a, 'BossBrain') || IsKind(a, 'CommanderKeen');
+	}
+
+	// Jefes vivos que hay que matar (los 12 más cercanos)
+	void AddBossGoals(PlayerPawn pmo)
+	{
+		Array<Actor> mons;
+		Array<double> md;
+		let it = ThinkerIterator.Create("Actor");
+		Actor a;
+		while (a = Actor(it.Next()))
+		{
+			if (a.health <= 0 || a.bCorpse || !a.CurSector || !IsLevelBoss(a)) continue;
+			mons.Push(a);
+			md.Push(pmo.Distance2D(a));
+		}
+		for (int n = 0; n < 12 && mons.Size() > 0; n++)
+		{
+			int b = 0;
+			for (int i = 1; i < md.Size(); i++) if (md[i] < md[b]) b = i;
+			Actor m = mons[b];
+			AddGoal(m.CurSector.Index(), m.pos.x, m.pos.y, OBJ_KILL, -1, 0);
+			mons.Delete(b);
+			md.Delete(b);
+		}
+	}
+
+	// Sectores a los que ya se puede llegar (búsqueda completa sin objetivo)
+	void Reach(out Array<int> r)
+	{
+		ClearGoals();
+		AddGoal(-5, 0, 0, OBJ_NONE, -1, 0);     // objetivo imposible: explora todo
+		Run(0);
+		r.Resize(nS);
+		for (int i = 0; i < nS; i++) r[i] = 0;
+		int n = 2 * nL + nT + 1;
+		for (int v = 0; v < n; v++)
+		{
+			if (!done[v]) continue;
+			int s; double x, y;
+			[s, x, y] = NodeInfo(v);
+			if (s >= 0) r[s] = 1;
+		}
+	}
+
+	// ¿El sector s puede abrir camino nuevo? (no se llega a él o toca una zona a la que no se llega)
+	bool Opens(int s, Array<int> r)
+	{
+		if (!r[s]) return true;
+		Sector sec = level.Sectors[s];
+		for (int k = 0; k < sec.lines.Size(); k++)
+		{
+			Line l = sec.lines[k];
+			if (!l.backsector) continue;
+			int o = (l.frontsector.Index() == s) ? l.backsector.Index() : l.frontsector.Index();
+			if (!r[o]) return true;
+		}
+		return false;
+	}
+
+	// Sin camino conocido: el interruptor / zona / teletransporte más cercano que pueda abrir algo nuevo
+	bool Explore(GCPlayerState q)
+	{
+		Array<int> r;
+		Reach(r);
+		ClearGoals();
+		for (int i = 0; i < nL; i++)
+		{
+			Line l = level.Lines[i];
+			int sp = l.special;
+			if (!sp || !(l.activation & SPAC_PlayerActivate)) continue;
+			if (q.gVisited.Find(i) != q.gVisited.Size()) continue;
+			if (!HasLock(LockOf(l))) continue;           // necesita una llave que no tienes
+			bool useful = false;
+			if (tele[i] >= 0) useful = !r[tds[tele[i]]];
+			else if (OpKind(sp) != OP_NONE)
+			{
+				int tag = l.args[0];
+				if (tag == 0) useful = l.backsector && Opens(l.backsector.Index(), r);
+				else
+				{
+					let it = level.CreateSectorTagIterator(tag);
+					int s;
+					while (!useful && (s = it.Next()) >= 0) useful = Opens(s, r);
+				}
+			}
+			if (!useful) continue;
+			int a = l.activation;
+			int kind = OBJ_SHOOT;
+			if (tele[i] >= 0 || (a & (SPAC_Cross | SPAC_AnyCross))) kind = OBJ_WALK;
+			else if (a & (SPAC_Use | SPAC_UseThrough | SPAC_Push | SPAC_UseBack)) kind = OBJ_SWITCH;
+			int lk = LockOf(l);
+			if (lk > 0) kind = OBJ_LOCKED;
+			int g0 = gs.Size();
+			AddLineGoal(i, kind);
+			if (lk > 0) for (int g = g0; g < gc.Size(); g++) gc[g] = LockBits(lk);
+		}
+		if (!RunEmit(q)) return false;
+		q.gObj = emittedKind;
+		LockedGoal(q);
+		q.gExplore = q.gObj != OBJ_LOCKED;
+		return true;
+	}
+
+	// ======================= plan =======================
+
+	double FloorAt(double x, double y)
+	{
+		Sector s = level.PointInSector((x, y));
+		return s ? s.floorplane.ZatPoint((x, y)) : 0;
+	}
+
+	void Pt(GCPlayerState q, double x, double y, double z, int jump, int sec = -1)
+	{
+		q.rx.Push(x);
+		q.ry.Push(y);
+		q.rz.Push(z);
+		q.rj.Push(jump);
+		rsec.Push(sec);
+	}
+
+	void Step(GCPlayerState q, int kind, int line)
+	{
+		q.sk.Push(kind);
+		q.sp.Push(q.rx.Size() - 1);
+		q.sl.Push(line);
+	}
+
+	void ClearRoute(GCPlayerState q)
+	{
+		q.rx.Clear(); q.ry.Clear(); q.rz.Clear(); q.rj.Clear();
+		q.sk.Clear(); q.sp.Clear(); q.sl.Clear();
+		q.gLine = -1;
+		rsec.Clear();
+	}
+
+	// Punto de la línea li más cercano a (px, py), sin pegarse a las esquinas
+	Vector2 CrossPoint(int li, double px, double py)
+	{
+		Line l = level.Lines[li];
+		Vector2 a = l.v1.p;
+		Vector2 d = l.delta;
+		double len2 = d dot d;
+		if (len2 < 1) return (mx[li], my[li]);
+		double t = ((px - a.x) * d.x + (py - a.y) * d.y) / len2;
+		double m = min(0.5, 20 / sqrt(len2));
+		t = clamp(t, m, 1 - m);
+		return a + d * t;
+	}
+
+	double LineFloor(int li, Vector2 p)
+	{
+		Line l = level.Lines[li];
+		double z = l.frontsector.floorplane.ZatPoint(p);
+		if (l.backsector) z = max(z, l.backsector.floorplane.ZatPoint(p));
+		return z;
+	}
+
+	void Emit(GCPlayerState q, int obj)
+	{
+		int n = 2 * nL + nT + 2;
+		int SN = n - 2;
+		int GN = n - 1;
+		Array<int> ch;
+		for (int v = GN; v >= 0 && v != SN; v = prv[v]) ch.Push(v);
+		ClearRoute(q);
+		segFrom.Clear(); segTo.Clear();
+		int cur = ssec;                       // sector en el que vamos
+		Pt(q, sx, sy, sz, 0, cur);
+		segFrom.Push(-1); segTo.Push(-1);     // el punto de salida no cierra ningún tramo
+		q.gLine = -1;
+		int u = SN;
+		for (int i = ch.Size() - 1; i >= 0; i--)
+		{
+			int v = ch[i];
+			int a = pact[v];
+			int al = pln[v];
+			// cada punto que se añade cierra un tramo que pertenece a la arista u -> v
+			int s0 = q.rx.Size();
+			if (v == GN)
+			{
+				int g = bestGoal;
+				Pt(q, gx[g], gy[g], FloorAt(gx[g], gy[g]), 0, cur);
+				q.gLine = gl[g];
+				segFrom.Push(u); segTo.Push(GN);
+				break;
+			}
+			if (v >= 2 * nL)     // llegada de un teletransporte
+			{
+				Vector2 tc = CrossPoint(al, q.rx[q.rx.Size() - 1], q.ry[q.ry.Size() - 1]);
+				Pt(q, tc.x, tc.y, LineFloor(al, tc), 0, cur);
+				Step(q, A_TELE, al);
+				int k = v - 2 * nL;
+				cur = tds[k];
+				Pt(q, tdx[k], tdy[k], FloorAt(tdx[k], tdy[k]), 1, cur);
+				for (int j = s0; j < q.rx.Size(); j++) { segFrom.Push(u); segTo.Push(v); }
+				u = v;
+				continue;
+			}
+			int li = v >> 1;
+			if (a != A_NONE && a != A_REMOTE && al >= 0 && al != li)
+			{
+				// antes de cruzar hay que activar algo que está en otra pared
+				Vector2 tp = TrigPoint(al);
+				Pt(q, tp.x, tp.y, FloorAt(tp.x, tp.y), 0, cur);
+				Step(q, a, al);
+				a = A_NONE;
+			}
+			Vector2 c = CrossPoint(li, q.rx[q.rx.Size() - 1], q.ry[q.ry.Size() - 1]);
+			int nsec;
+			double nx, ny;
+			[nsec, nx, ny] = NodeInfo(v);
+			Pt(q, c.x, c.y, LineFloor(li, c), 0, nsec);
+			cur = nsec;
+			if (a != A_NONE && a != A_REMOTE) Step(q, a, li);
+			for (int k = s0; k < q.rx.Size(); k++) { segFrom.Push(u); segTo.Push(v); }
+			u = v;
+		}
+		while (segFrom.Size() < q.rx.Size()) { segFrom.Push(u); segTo.Push(GN); }
+		q.gObj = obj;
+		Refine(q);
+	}
+
+	// ======================= rodeos dentro de una sala =======================
+
+	static double Cr(Vector2 a, Vector2 b) { return a.x * b.y - a.y * b.x; }
+
+	static double PtSeg(Vector2 c, Vector2 a, Vector2 b)
+	{
+		Vector2 e = b - a;
+		double len2 = e dot e;
+		double t = (len2 > 0) ? clamp(((c - a) dot e) / len2, 0, 1) : 0;
+		return (a + e * t - c).Length();
+	}
+
+	bool IsWall(Line l, int s)
+	{
+		int li = l.Index();
+		return (l.frontsector.Index() == s) ? wall0[li] != 0 : wall1[li] != 0;
+	}
+
+	// ¿Cabe el jugador (radio 16) por el tramo p-q sin salir del sector s ni rozar paredes u objetos?
+	// Las paredes que ya tocan p o q (p. ej. la línea por la que se entra) no cuentan.
+	bool Blocked(Vector2 p, Vector2 q, int s)
+	{
+		double R = 15.0;
+		Sector sec = level.Sectors[s];
+		Vector2 d = q - p;
+		for (int k = 0; k < sec.lines.Size(); k++)
+		{
+			Line l = sec.lines[k];
+			Vector2 a = l.v1.p;
+			Vector2 b = l.v2.p;
+			bool wall = IsWall(l, s);
+			if (!wall && l.backsector && l.frontsector.Index() == l.backsector.Index()) continue;
+			// ¿lo atraviesa? (las líneas que no son pared solo cuentan si se sale del sector)
+			Vector2 e = b - a;
+			double d1 = Cr(e, p - a), d2 = Cr(e, q - a);
+			bool cuts = false;
+			if (!((d1 > 0.5 && d2 > 0.5) || (d1 < -0.5 && d2 < -0.5) || abs(d1) <= 0.5 || abs(d2) <= 0.5))
+			{
+				double d3 = Cr(d, a - p), d4 = Cr(d, b - p);
+				cuts = (d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0);
+			}
+			if (cuts) return true;
+			if (!wall) continue;
+			// ¿pasa demasiado cerca de la pared?
+			if (PtSeg(p, a, b) < R || PtSeg(q, a, b) < R) continue;
+			double md = min(min(PtSeg(a, p, q), PtSeg(b, p, q)), min(PtSeg(p, a, b), PtSeg(q, a, b)));
+			if (md < R) return true;
+		}
+		// objetos sólidos (si uno de los extremos ya está pegado a él, no cuenta)
+		double len2 = d dot d;
+		for (int k = 0; k < obs.Size(); k++)
+		{
+			if (obs[k] != s) continue;
+			Vector2 c = (obx[k], oby[k]);
+			double r = obr[k] + 15;
+			if ((p - c).Length() < r || (q - c).Length() < r) continue;
+			double t = (len2 > 0) ? clamp(((c - p) dot d) / len2, 0, 1) : 0;
+			if ((p + d * t - c).Length() < r) return true;
+		}
+		return false;
+	}
+
+	// ¿El punto c está a más de r de todas las paredes (y objetos) del sector s?
+	bool Clear(Vector2 c, int s, double r)
+	{
+		Sector sec = level.Sectors[s];
+		for (int k = 0; k < sec.lines.Size(); k++)
+		{
+			Line l = sec.lines[k];
+			if (!IsWall(l, s)) continue;
+			if (PtSeg(c, l.v1.p, l.v2.p) < r) return false;
+		}
+		for (int k = 0; k < obs.Size(); k++)
+		{
+			if (obs[k] != s) continue;
+			Vector2 oc = (obx[k], oby[k]);
+			if ((oc - c).Length() < obr[k] + r) return false;
+		}
+		return true;
+	}
+
+	// Camino más corto de p a q sin salir del sector s, pasando por las esquinas (A* sobre las esquinas)
+	int Detour(Vector2 p, Vector2 q, int s, out Array<double> outPts)
+	{
+		Sector sec = level.Sectors[s];
+		if (sec.lines.Size() > 160) return -1;      // demasiado grande: no se comprueba
+		Array<double> nx, ny;
+		nx.Push(p.x); ny.Push(p.y);
+		nx.Push(q.x); ny.Push(q.y);
+		Array<int> seen;
+		for (int k = 0; k < sec.lines.Size(); k++)
+		{
+			Line l = sec.lines[k];
+			for (int w = 0; w < 2; w++)
+			{
+				Vector2 vp = w ? l.v2.p : l.v1.p;
+				int vi = w ? l.v2.Index() : l.v1.Index();
+				if (seen.Find(vi) != seen.Size()) continue;
+				seen.Push(vi);
+				int got = 0;
+				for (int dd = 0; dd < 8 && got < 2; dd++)
+				{
+					double ang = dd * 45 + 22.5;
+					Vector2 c = vp + (cos(ang), sin(ang)) * 26;
+					Sector cs2 = level.PointInSector(c);
+					if (!cs2 || cs2.Index() != s || !Clear(c, s, 18)) continue;
+					bool dup = false;
+					for (int j = 2; j < nx.Size(); j++)
+					{
+						Vector2 dv = c - (nx[j], ny[j]);
+						if (dv.Length() < 24) { dup = true; break; }
+					}
+					if (dup) continue;
+					nx.Push(c.x); ny.Push(c.y);
+					got++;
+				}
+			}
+		}
+		for (int k = 0; k < obs.Size(); k++)
+		{
+			if (obs[k] != s) continue;
+			for (int dd = 0; dd < 4; dd++)
+			{
+				double ang = dd * 90 + 45;
+				Vector2 c = (obx[k], oby[k]) + (cos(ang), sin(ang)) * (obr[k] + 30);
+				Sector cs2 = level.PointInSector(c);
+				if (!cs2 || cs2.Index() != s || !Clear(c, s, 18)) continue;
+				nx.Push(c.x); ny.Push(c.y);
+			}
+		}
+		int n = nx.Size();
+		Array<double> g;
+		Array<int> from, closed;
+		g.Resize(n); from.Resize(n); closed.Resize(n);
+		for (int i = 0; i < n; i++) { g[i] = 1e30; from[i] = -1; closed[i] = 0; }
+		g[0] = 0;
+		for (int iter = 0; iter < n; iter++)
+		{
+			// nodo abierto con menor g + h
+			int u = -1;
+			double bf = 1e30;
+			for (int i = 0; i < n; i++)
+			{
+				if (closed[i] || g[i] >= 1e29) continue;
+				double f = g[i] + Len2D(nx[i], ny[i], q.x, q.y);
+				if (f < bf) { bf = f; u = i; }
+			}
+			if (u < 0) return 0;
+			if (u == 1) break;
+			closed[u] = 1;
+			Vector2 up = (nx[u], ny[u]);
+			for (int i = 0; i < n; i++)
+			{
+				if (closed[i] || i == u) continue;
+				double c = g[u] + Len2D(nx[u], ny[u], nx[i], ny[i]);
+				if (c >= g[i]) continue;
+				if (Blocked(up, (nx[i], ny[i]), s)) continue;
+				g[i] = c;
+				from[i] = u;
+			}
+		}
+		if (from[1] < 0)
+		{
+			return 0;
+		}
+		Array<int> chain;
+		for (int v = from[1]; v > 0; v = from[v]) chain.Push(v);
+		outPts.Clear();
+		for (int i = chain.Size() - 1; i >= 0; i--) { outPts.Push(nx[chain[i]]); outPts.Push(ny[chain[i]]); }
+		return 1;
+	}
+
+	// Sustituye los tramos que atraviesan paredes por rodeos (con caché)
+	void Refine(GCPlayerState q)
+	{
+		failU = -1;
+		failV = -1;
+		failSec = -1;
+		int np = q.rx.Size();
+		if (np < 2) return;
+		Array<double> ox, oy, oz;
+		Array<int> oj;
+		// los pasos apuntan a índices de la ruta: hay que reajustarlos
+		Array<int> remap;
+		remap.Resize(np);
+		ox.Push(q.rx[0]); oy.Push(q.ry[0]); oz.Push(q.rz[0]); oj.Push(q.rj[0]);
+		remap[0] = 0;
+		for (int i = 0; i + 1 < np; i++)
+		{
+			int s = rsec[i];
+			Vector2 a = (q.rx[i], q.ry[i]);
+			Vector2 b = (q.rx[i + 1], q.ry[i + 1]);
+			if (q.rj[i + 1] == 0 && s >= 0 && Blocked(a, b, s))
+			{
+				Array<double> pts;
+				int ok = 0;
+				int hit = -1;
+				for (int k = 0; k < ckSec.Size(); k++)
+				{
+					if (ckSec[k] != s) continue;
+					if (abs(ckA[2 * k] - a.x) > 8 || abs(ckA[2 * k + 1] - a.y) > 8) continue;
+					if (abs(ckB[2 * k] - b.x) > 8 || abs(ckB[2 * k + 1] - b.y) > 8) continue;
+					hit = k;
+					break;
+				}
+				if (hit >= 0)
+				{
+					for (int j = 0; j < ckLen[hit]; j++) pts.Push(ckPts[ckStart[hit] + j]);
+					ok = 1;
+				}
+				else
+				{
+					ok = Detour(a, b, s, pts);
+					refineCount++;
+					if (ok == 1 && ckSec.Size() < 96)
+					{
+						ckSec.Push(s);
+						ckA.Push(a.x); ckA.Push(a.y);
+						ckB.Push(b.x); ckB.Push(b.y);
+						ckStart.Push(ckPts.Size());
+						ckLen.Push(pts.Size());
+						for (int j = 0; j < pts.Size(); j++) ckPts.Push(pts[j]);
+					}
+				}
+				if (ok == 0 && failU < 0 && i + 1 < segFrom.Size())
+				{
+					// el jugador no cabe: este paso de la ruta es imposible
+					failU = segFrom[i + 1];
+					failV = segTo[i + 1];
+					failSec = s;
+					if (dbg) dbgSeg = String.Format("sec %d (%d,%d)->(%d,%d)", s, a.x, a.y, b.x, b.y);
+				}
+				if (ok == 1)
+				{
+					for (int j = 0; j + 1 < pts.Size(); j += 2)
+					{
+						ox.Push(pts[j]); oy.Push(pts[j + 1]);
+						oz.Push(FloorAt(pts[j], pts[j + 1]));
+						oj.Push(0);
+					}
+				}
+			}
+			ox.Push(b.x); oy.Push(b.y); oz.Push(q.rz[i + 1]); oj.Push(q.rj[i + 1]);
+			remap[i + 1] = ox.Size() - 1;
+		}
+		for (int k = 0; k < q.sp.Size(); k++) q.sp[k] = remap[q.sp[k]];
+		q.rx.Move(ox); q.ry.Move(oy); q.rz.Move(oz); q.rj.Move(oj);
+	}
+
+	// Sin camino: al menos una flecha en línea recta
+	void EmitDirect(GCPlayerState q, int obj, double x, double y)
+	{
+		ClearRoute(q);
+		Pt(q, sx, sy, sz, 0);
+		Pt(q, x, y, FloorAt(x, y), 2);
+		q.gObj = obj;
+		q.gLine = -1;
+	}
+
+	// Qué puntos de la ruta se ven desde los ojos del jugador (los que no, se dibujan tenues)
+	void Visibility(GCPlayerState q, PlayerPawn pmo)
+	{
+		q.rv.Clear();
+		double vh = pmo.player ? pmo.player.viewheight : 41;
+		Vector3 eye = pmo.pos + (0, 0, vh);
+		bool jumped = false;
+		for (int i = 0; i < q.rx.Size(); i++)
+		{
+			if (q.rj[i] != 0) jumped = true;
+			if (jumped || i > 30) { q.rv.Push(0); continue; }
+			Vector3 d = (q.rx[i], q.ry[i], q.rz[i] + 24) - eye;
+			double len = d.Length();
+			if (len < 40) { q.rv.Push(1); continue; }
+			double hl = d.xy.Length();
+			double pit = -atan2(d.z, hl);
+			bool hit = pmo.LineTrace(atan2(d.y, d.x), len - 12, pit, TRF_THRUACTORS, vh);
+			q.rv.Push(hit ? 0 : 1);
+		}
+	}
+
+	// Calcula la ruta del jugador hasta su siguiente objetivo
+	// ======================= llaves =======================
+
+	// Llave que pide una línea (0 = ninguna)
+	static int LockOf(Line l)
+	{
+		if (l.locknumber > 0) return l.locknumber;
+		switch (l.special)
+		{
+		case 13:  return l.args[3];      // Door_LockedRaise (puertas de llave de DOOM)
+		case 14:  return l.args[3];      // Door_Animated
+		case 202: return l.args[4];      // Generic_Door
+		case 83:  return l.args[4];      // ACS_LockedExecute
+		case 85:  return l.args[4];      // ACS_LockedExecuteDoor
+		}
+		return 0;
+	}
+
+	bool HasLock(int lk)
+	{
+		return lk <= 0 || assumeKeys || !who || who.CheckKeys(lk, false, true);
+	}
+
+	// Color que pide una cerradura: 1 roja, 2 azul, 4 amarilla, 8 otra (cualquiera / todas)
+	static int LockBits(int lk)
+	{
+		switch (lk)
+		{
+		case 1: case 4: case 129: return 1;
+		case 2: case 5: case 130: return 2;
+		case 3: case 6: case 131: return 4;
+		}
+		return 8;
+	}
+
+	static int KeyBit(Actor k)
+	{
+		if (IsKind(k, 'RedCard') || IsKind(k, 'RedSkull')) return 1;
+		if (IsKind(k, 'BlueCard') || IsKind(k, 'BlueSkull')) return 2;
+		if (IsKind(k, 'YellowCard') || IsKind(k, 'YellowSkull')) return 4;
+		return 8;
+	}
+
+	// ¿El sector x tiene algún disparador que se pueda usar con las llaves que tienes?
+	bool AnyUsableTrig(int x)
+	{
+		for (int k = ts[x]; k < ts[x + 1]; k++) if (HasLock(LockOf(level.Lines[tl[k]]))) return true;
+		return false;
+	}
+
+	// Llaves que pide el camino encontrado (las que no tienes)
+	int PathLocks(PlayerPawn pmo)
+	{
+		int n = 2 * nL + nT + 2;
+		int SN = n - 2;
+		int GN = n - 1;
+		int need = 0;
+		for (int v = GN; v >= 0 && v != SN; v = prv[v])
+		{
+			int a = pact[v], al = pln[v];
+			if (a == A_NONE || al < 0) continue;
+			if (a == A_REMOTE)
+			{
+				// se abre desde otro sitio: si todos sus disparadores son de llave, cuentan esas llaves
+				if (al >= nS) continue;
+				bool free = false;
+				int bits = 0;
+				for (int k = ts[al]; k < ts[al + 1]; k++)
+				{
+					int lk = LockOf(level.Lines[tl[k]]);
+					if (lk <= 0 || pmo.CheckKeys(lk, false, true)) { free = true; break; }
+					bits |= LockBits(lk);
+				}
+				if (!free) need |= bits;
+				continue;
+			}
+			if (al >= nL) continue;
+			int lk = LockOf(level.Lines[al]);
+			if (lk > 0 && !pmo.CheckKeys(lk, false, true)) need |= LockBits(lk);
+		}
+		return need;
+	}
+
+	// Llegar a los objetivos puestos: directamente o abriendo antes lo que haga falta (interruptores)
+	bool ReachGoals(GCPlayerState q)
+	{
+		for (int i = 0; i < nS; i++) forbid[i] = 0;
+		if (RunEmit(q)) { q.gObj = emittedKind; return true; }
+		// Hay que abrir algo antes: busca el interruptor (varios niveles de "esto abre aquello")
+		for (int depth = 0; depth < 6; depth++)
+		{
+			bool r1 = Run(1);
+			int x = r1 ? FirstRemote(q) : -1;
+			if (dbg) Console.Printf("PLAN depth %d run1=%d remote=%d", depth, r1, x);
+			if (!r1 || x < 0) break;
+			forbid[x] = 1;
+			ClearGoals();
+			AddTriggerGoals(x);
+			if (dbg) Console.Printf("PLAN   triggers of %d: %d goals", x, gs.Size());
+			if (RunEmit(q)) { q.gObj = emittedKind; LockedGoal(q); return true; }
+		}
+		return false;
+	}
+
+	// El objetivo es una puerta (o interruptor) de llave: color y qué hacer
+	void LockedGoal(GCPlayerState q)
+	{
+		if (q.gObj != OBJ_LOCKED || bestGoal < 0 || bestGoal >= gc.Size()) return;
+		q.gKey = gc[bestGoal];
+		q.gStep = (q.gLine >= 0 && q.gLine < nL && IsDoorSpecial(level.Lines[q.gLine].special)) ? A_DOOR : A_USE;
+	}
+
+	// La salida pide una llave que no tienes: marca esa llave (o la que se pueda coger ya)
+	bool PlanKeys(GCPlayerState q, PlayerPawn pmo)
+	{
+		Array<Actor> keys;
+		Array<int> kc;
+		let it = ThinkerIterator.Create("Key");
+		Inventory k;
+		while (k = Inventory(it.Next()))
+		{
+			if (k.Owner || !k.CurSector || k.bInvisible) continue;
+			if (pmo.FindInventory(k.GetClass())) continue;          // esa ya la tienes
+			keys.Push(k);
+			kc.Push(KeyBit(k));
+		}
+		if (keys.Size() == 0) return false;
+		// ¿qué llaves pide el camino a la salida? (se busca como si las tuvieras todas)
+		int need = 0;
+		assumeKeys = true;
+		ClearGoals();
+		AddExitGoals(false);
+		for (int i = 0; i < nS; i++) forbid[i] = 0;
+		if (gs.Size() > 0 && Run(1)) need = PathLocks(pmo);
+		assumeKeys = false;
+		lastNeed = need;
+		if (dbg) Console.Printf("PLAN keys: %d en el mapa, hacen falta %d", keys.Size(), need);
+		for (int pass = 0; pass < 2; pass++)
+		{
+			ClearGoals();
+			for (int i = 0; i < keys.Size(); i++)
+			{
+				// primero, solo las del color que hace falta; si no se llega a ninguna, cualquiera
+				if (pass == 0 && need != 0 && !(need & 8) && !(need & kc[i])) continue;
+				AddGoal(keys[i].CurSector.Index(), keys[i].pos.x, keys[i].pos.y, OBJ_KEY, -1, 0);
+				gc[gc.Size() - 1] = kc[i];
+			}
+			if (gs.Size() > 0 && ReachGoals(q))
+			{
+				q.gKey = (q.gObj == OBJ_KEY && bestGoal >= 0 && bestGoal < gc.Size()) ? gc[bestGoal] : 0;
+				return true;
+			}
+			if (pass == 0 && (need == 0 || (need & 8))) break;     // ya se probaron todas
+		}
+		return false;
+	}
+
+	// No se sabe el camino hasta la llave que falta: al menos se marca dónde está (en línea recta)
+	bool KeyDirect(GCPlayerState q, PlayerPawn pmo)
+	{
+		Actor best;
+		double bd = 1e30;
+		bool bestNeeded = false;
+		let it = ThinkerIterator.Create("Key");
+		Inventory k;
+		while (k = Inventory(it.Next()))
+		{
+			if (k.Owner || !k.CurSector || k.bInvisible || pmo.FindInventory(k.GetClass())) continue;
+			bool needed = lastNeed == 0 || (lastNeed & 8) || (lastNeed & KeyBit(k));
+			double d = pmo.Distance2D(k);
+			if ((needed && !bestNeeded) || (needed == bestNeeded && d < bd)) { best = k; bd = d; bestNeeded = needed; }
+		}
+		if (!best) return false;
+		EmitDirect(q, OBJ_KEY, best.pos.x, best.pos.y);
+		q.gKey = KeyBit(best);
+		q.gExplore = true;
+		return true;
+	}
+
+	// Si el camino pasa por una puerta (o interruptor) de llave, ese es el siguiente objetivo:
+	// la ruta se corta ahí y, una vez abierta, sigue hasta el objetivo de después
+	void FocusLocked(GCPlayerState q)
+	{
+		for (int k = 0; k < q.sk.Size(); k++)
+		{
+			int li = q.sl[k];
+			if (li < 0 || li >= nL) continue;
+			if (q.sk[k] == A_TELE || q.sk[k] == A_LIFT) continue;
+			int lk = LockOf(level.Lines[li]);
+			if (lk <= 0) continue;
+			int p = q.sp[k];
+			if (p < 1 || p >= q.rx.Size()) continue;
+			q.rx.Resize(p + 1); q.ry.Resize(p + 1); q.rz.Resize(p + 1); q.rj.Resize(p + 1);
+			q.gStep = q.sk[k];
+			q.sk.Resize(k); q.sp.Resize(k); q.sl.Resize(k);
+			q.gObj = OBJ_LOCKED;
+			q.gKey = LockBits(lk);
+			q.gLine = li;
+			return;
+		}
+	}
+
+	void Plan(GCPlayerState q, PlayerPawn pmo)
+	{
+		if (nL != level.Lines.Size() || nS != level.Sectors.Size()) Init();
+		Prepare();
+		sx = pmo.pos.x;
+		sy = pmo.pos.y;
+		sz = pmo.floorz;
+		ssec = pmo.CurSector.Index();
+		startMask = PointMask(sx, sy, ssec);
+		q.gExplore = false;
+		q.gBoss = false;
+
+		who = pmo;
+		assumeKeys = false;
+		// 1. La salida, si ya se puede llegar (o abriendo antes algún interruptor); sin llaves que no tengas
+		ClearGoals();
+		AddExitGoals(false);
+		if (gs.Size() > 0 && ReachGoals(q)) { FocusLocked(q); q.gMiss = 0; return; }
+		// 2. Falta una llave: la que pide el camino a la salida (o, si aún no se llega a ella, otra que sí)
+		if (PlanKeys(q, pmo)) { FocusLocked(q); q.gMiss = 0; return; }
+		// 3. Niveles que se terminan (o se abren) matando al jefe
+		ClearGoals();
+		AddBossGoals(pmo);
+		if (gs.Size() > 0)
+		{
+			if (RunEmit(q)) q.gObj = OBJ_KILL;
+			else EmitDirect(q, OBJ_KILL, gx[0], gy[0]);
+			q.gBoss = true;
+			q.gMiss = 0;
+			return;
+		}
+		// 4. La salida secreta, si es lo único a lo que se llega
+		ClearGoals();
+		AddExitGoals(true);
+		if (RunEmit(q)) { q.gObj = OBJ_SECRET; q.gMiss = 0; return; }
+		// 5. Explorar: el interruptor más cercano que pueda abrir camino
+		if (Explore(q)) { q.gMiss = 0; return; }
+		// 6. Al menos, dónde está la llave que falta (sin camino conocido)
+		if (KeyDirect(q, pmo)) { q.gMiss = 0; return; }
+		// Nada: se mantiene la ruta anterior unos segundos (p. ej. mientras termina de abrirse algo)
+		if (++q.gMiss <= 24 && q.rx.Size() >= 2) return;
+		ClearRoute(q);
+		q.gObj = OBJ_NONE;
+	}
+}
+
+// ============================================================
+//  Dibujo de la guía (solo en tu pantalla: en cooperativo cada
+//  jugador ve únicamente su propio rastro)
+// ============================================================
+class GCGuiaDraw ui
+{
+	Shape2D glow, core0, core1, core2, big, mid, arrowG, arrow;
+	int nGlow, nC0, nC1, nC2, nBig, nMid, nArG, nAr;
+
+	// cámara de este fotograma
+	Vector3 vp;
+	double ca, sa, cp, sn, ps, foc, cx, cy, tsc, now;
+	int vx, vy, vw, vh;
+
+	// resultado para el texto del HUD
+	double rem;       // distancia que falta (unidades del mapa)
+	int nextStep;     // índice del siguiente paso (-1 ninguno)
+	int seg;          // tramo de la ruta en el que estás
+
+	const SPACING = 48.0;
+	const MAXD = 1400.0;
+
+	// DrawShapeFill (GZDoom 4.14) pinta el rojo y el azul intercambiados: se compensa aquí
+	static Color Col(int r, int g, int b) { return Color(255, b, g, r); }
+
+	Shape2D NewShape(Shape2D s)
+	{
+		if (!s) s = new("Shape2D");
+		s.Clear();
+		return s;
+	}
+
+	int Dia(Shape2D s, int n, double x, double y, double r)
+	{
+		s.PushVertex((x, y - r));
+		s.PushVertex((x + r * 0.72, y));
+		s.PushVertex((x, y + r));
+		s.PushVertex((x - r * 0.72, y));
+		for (int i = 0; i < 4; i++) s.PushCoord((0, 0));
+		s.PushTriangle(n, n + 1, n + 2);
+		s.PushTriangle(n, n + 2, n + 3);
+		return n + 4;
+	}
+
+	int Tri(Shape2D s, int n, Vector2 a, Vector2 b, Vector2 c)
+	{
+		s.PushVertex(a); s.PushVertex(b); s.PushVertex(c);
+		for (int i = 0; i < 3; i++) s.PushCoord((0, 0));
+		s.PushTriangle(n, n + 1, n + 2);
+		return n + 3;
+	}
+
+	// De un punto del mapa a la pantalla
+	bool, double, double, double Proj(Vector3 p)
+	{
+		Vector3 d = p - vp;
+		double fwd = d.x * ca + d.y * sa;
+		double side = d.x * sa - d.y * ca;
+		double up = d.z * ps;
+		double depth = fwd * cp - up * sn;
+		double vert = fwd * sn + up * cp;
+		if (depth < 4) return false, 0, 0, depth;
+		return true, cx + side / depth * foc, cy - vert / depth * foc, depth;
+	}
+
+	bool OnScreen(double x, double y, double m)
+	{
+		return x > vx + m && x < vx + vw - m && y > vy + m && y < vy + vh - m;
+	}
+
+	void Label(String s, double x, double y, int col)
+	{
+		double w = smallfont.StringWidth(s) * tsc;
+		Screen.DrawText(smallfont, col, x - w / 2, y, s, DTA_ScaleX, tsc, DTA_ScaleY, tsc);
+	}
+
+	// Punto de la ruta a cierta distancia por delante
+	Vector3 Ahead(GCPlayerState q, int s, double t, double dist)
+	{
+		for (int i = s; i + 1 < q.rx.Size(); i++)
+		{
+			if (q.rj[i + 1] == 1) return (q.rx[i], q.ry[i], q.rz[i]);
+			Vector3 a = (q.rx[i], q.ry[i], q.rz[i]);
+			Vector3 b = (q.rx[i + 1], q.ry[i + 1], q.rz[i + 1]);
+			double len = (b.xy - a.xy).Length();
+			double pos = (i == s) ? t * len : 0;
+			if (pos + dist <= len && len > 0) return a + (b - a) * ((pos + dist) / len);
+			dist -= len - pos;
+		}
+		int k = q.rx.Size() - 1;
+		return (q.rx[k], q.ry[k], q.rz[k]);
+	}
+
+	static String StepWord(int k)
+	{
+		switch (k)
+		{
+		case GCNav.A_DOOR:  return "PUERTA";
+		case GCNav.A_USE:   return "INTERRUPTOR";
+		case GCNav.A_CROSS: return "PASA POR AQUI";
+		case GCNav.A_SHOOT: return "DISPARA AQUI";
+		case GCNav.A_LIFT:  return "ASCENSOR";
+		case GCNav.A_TELE:  return "TELETRANSPORTE";
+		}
+		return "";
+	}
+
+	static String GoalWord(GCPlayerState q)
+	{
+		switch (q.gObj)
+		{
+		case GCNav.OBJ_EXIT:   return "SALIDA";
+		case GCNav.OBJ_SECRET: return "SALIDA SECRETA";
+		case GCNav.OBJ_SWITCH: return "INTERRUPTOR";
+		case GCNav.OBJ_WALK:   return "PASA POR AQUI";
+		case GCNav.OBJ_SHOOT:  return "DISPARA AQUI";
+		case GCNav.OBJ_KILL:   return q.gBoss ? "JEFE" : "ENEMIGO";
+		case GCNav.OBJ_KEY:    return "LLAVE" .. ColorWord(q.gKey);
+		case GCNav.OBJ_LOCKED: return (q.gStep == GCNav.A_DOOR ? "PUERTA" : "INTERRUPTOR") .. ColorWord(q.gKey);
+		}
+		return "";
+	}
+
+	static String ColorWord(int bits)
+	{
+		if (bits == 1) return " ROJA";
+		if (bits == 2) return " AZUL";
+		if (bits == 4) return " AMARILLA";
+		return "";
+	}
+
+	static int ColorFont(GCPlayerState q)
+	{
+		if (q.gObj == GCNav.OBJ_EXIT) return Font.CR_GREEN;
+		if (q.gObj == GCNav.OBJ_KEY || q.gObj == GCNav.OBJ_LOCKED)
+		{
+			if (q.gKey == 1) return Font.CR_RED;
+			if (q.gKey == 2) return Font.CR_LIGHTBLUE;
+			if (q.gKey == 4) return Font.CR_YELLOW;
+		}
+		return Font.CR_GOLD;
+	}
+
+	void Draw(RenderEvent e, GCPlayerState q)
+	{
+		rem = 0;
+		nextStep = -1;
+		seg = 0;
+		int np = q.rx.Size();
+		if (np < 2) return;
+
+		// --- cámara ---
+		[vx, vy, vw, vh] = Screen.GetViewWindow();
+		if (vw <= 0 || vh <= 0) return;
+		vp = e.ViewPos;
+		ca = cos(e.ViewAngle); sa = sin(e.ViewAngle);
+		cp = cos(e.ViewPitch); sn = sin(e.ViewPitch);
+		ps = level.pixelstretch;
+		if (ps <= 0) ps = 1.2;
+		double fov = players[consoleplayer].FOV;
+		if (fov < 5 || fov > 170) fov = 90;
+		double ratio = double(vw) / vh;
+		double fr = (ratio >= 1.3) ? 4.0 / 3.0 : ratio;
+		foc = (vh / 2.0) * fr / tan(fov / 2);
+		cx = vx + vw / 2.0;
+		cy = vy + vh / 2.0;
+		tsc = max(1.0, floor(Screen.GetHeight() / 360.0));
+		now = level.maptime + e.FracTic;
+
+		// --- en qué tramo de la ruta estás ---
+		double best = 1e30, segT = 0;
+		for (int i = 0; i + 1 < np && i < 12; i++)
+		{
+			if (q.rj[i + 1] == 1) break;
+			double ax = q.rx[i], ay = q.ry[i];
+			double dx = q.rx[i + 1] - ax, dy = q.ry[i + 1] - ay;
+			double l2 = dx * dx + dy * dy;
+			double t = (l2 > 0) ? clamp(((vp.x - ax) * dx + (vp.y - ay) * dy) / l2, 0, 1) : 0;
+			double ex = ax + dx * t - vp.x, ey = ay + dy * t - vp.y;
+			double dd = ex * ex + ey * ey;
+			if (dd < best) { best = dd; seg = i; segT = t; }
+		}
+		// lo que falta
+		for (int i = seg; i + 1 < np; i++)
+		{
+			if (q.rj[i + 1] == 1) continue;
+			Vector2 dv = (q.rx[i + 1] - q.rx[i], q.ry[i + 1] - q.ry[i]);
+			double len = dv.Length();
+			rem += (i == seg) ? len * (1 - segT) : len;
+		}
+		for (int k = 0; k < q.sk.Size(); k++)
+			if (q.sp[k] > seg) { nextStep = k; break; }
+
+		if (automapactive) return;
+
+		glow = NewShape(glow); core0 = NewShape(core0); core1 = NewShape(core1); core2 = NewShape(core2);
+		big = NewShape(big); mid = NewShape(mid); arrowG = NewShape(arrowG); arrow = NewShape(arrow);
+		nGlow = 0; nC0 = 0; nC1 = 0; nC2 = 0; nBig = 0; nMid = 0; nArG = 0; nAr = 0;
+
+		// --- rastro de balizas que avanza hacia el objetivo ---
+		bool direct = q.rj[1] == 2;
+		if (!direct)
+		{
+			double mv = now * 1.6;
+			double phase = mv - floor(mv / SPACING) * SPACING;
+			double walked = 0;
+			double nextAt = SPACING - phase;
+			bool halt = false;
+			for (int i = seg; i + 1 < np && !halt; i++)
+			{
+				if (q.rj[i + 1] != 0) break;
+				Vector3 a = (q.rx[i], q.ry[i], q.rz[i]);
+				Vector3 b = (q.rx[i + 1], q.ry[i + 1], q.rz[i + 1]);
+				double len = (b.xy - a.xy).Length();
+				double pos = (i == seg) ? segT * len : 0;
+				while (pos + nextAt <= len)
+				{
+					pos += nextAt;
+					walked += nextAt;
+					nextAt = SPACING;
+					if (walked > MAXD) { halt = true; break; }
+					Vector3 p = a + (b - a) * (len > 0 ? pos / len : 0);
+					p.z += 20 + 3 * sin(now * 9 + walked * 4);
+					if ((p - vp).Length() < 40) continue;
+					bool vis; double x, y, dep;
+					[vis, x, y, dep] = Proj(p);
+					if (!vis || !OnScreen(x, y, -16)) continue;
+					double r = clamp(foc * 4.5 / dep, 1.5, 13);
+					// tramo que no se ve (detrás de una pared): más pequeño y tenue
+					bool seen = i < q.rv.Size() && (q.rv[i] || (i + 1 < q.rv.Size() && q.rv[i + 1]));
+					if (!seen) { nC2 = Dia(core2, nC2, x, y, r * 0.7); continue; }
+					nGlow = Dia(glow, nGlow, x, y, r * 2.3);
+					double f = walked / MAXD;
+					if (f < 0.5) nC0 = Dia(core0, nC0, x, y, r);
+					else nC1 = Dia(core1, nC1, x, y, r);
+				}
+				if (halt) break;
+				nextAt -= len - pos;
+				walked += len - pos;
+			}
+		}
+
+		// --- siguiente paso (puerta, interruptor, ascensor...) ---
+		int gi = np - 1;
+		String stepTxt = "";
+		double stepX, stepY;
+		if (nextStep >= 0 && q.sp[nextStep] != gi)
+		{
+			int p = q.sp[nextStep];
+			bool vis; double x, y, dep;
+			[vis, x, y, dep] = Proj((q.rx[p], q.ry[p], q.rz[p] + 44));
+			if (vis && OnScreen(x, y, 8))
+			{
+				double r = clamp(foc * 8 / dep, 4, 15);
+				nMid = Dia(mid, nMid, x, y, r);
+				stepTxt = StepWord(q.sk[nextStep]);
+				stepX = x;
+				stepY = y - r - 10 * tsc;
+			}
+		}
+
+		// --- objetivo ---
+		String goalTxt = "";
+		double goalX, goalY, goalR;
+		{
+			bool vis; double x, y, dep;
+			[vis, x, y, dep] = Proj((q.rx[gi], q.ry[gi], q.rz[gi] + 48));
+			if (vis && OnScreen(x, y, 8))
+			{
+				goalR = clamp(foc * 11 / dep, 6, 20);
+				double pulse = 1 + 0.12 * sin(now * 10);
+				nBig = Dia(big, nBig, x, y, goalR * pulse);
+				goalTxt = GoalWord(q);
+				goalX = x;
+				goalY = y;
+			}
+		}
+
+		// --- flecha de dirección alrededor de la mira ---
+		Vector3 tgt = direct ? (q.rx[gi], q.ry[gi], q.rz[gi]) : Ahead(q, seg, segT, 192);
+		{
+			bool vis; double x, y, dep;
+			[vis, x, y, dep] = Proj(tgt + (0, 0, 24));
+			double ang = Actor.deltaangle(e.ViewAngle, atan2(tgt.y - vp.y, tgt.x - vp.x));
+			if (!vis || !OnScreen(x, y, vw * 0.12) || abs(ang) > 35)
+			{
+				double th = -ang;      // 0 = hacia delante (arriba en la pantalla)
+				Vector2 dir = (sin(th), -cos(th));
+				Vector2 perp = (cos(th), sin(th));
+				double R = vh * 0.13;
+				double s = tsc;
+				Vector2 c = (cx, cy);
+				nArG = Tri(arrowG, nArG, c + dir * (R + 17 * s), c + dir * (R - 6 * s) + perp * 12 * s, c + dir * (R - 6 * s) - perp * 12 * s);
+				nAr = Tri(arrow, nAr, c + dir * (R + 12 * s), c + dir * (R - 2 * s) + perp * 8 * s, c + dir * (R - 2 * s) - perp * 8 * s);
+			}
+		}
+
+		// --- pintar ---
+		Screen.SetClipRect(vx, vy, vw, vh);
+		if (nGlow) Screen.DrawShapeFill(Col(255, 140, 20), 0.22, glow);       // halo naranja
+		if (nC2) Screen.DrawShapeFill(Col(255, 210, 70), 0.30, core2);        // tramo oculto tras paredes: tenue
+		if (nC1) Screen.DrawShapeFill(Col(255, 220, 90), 0.68, core1);
+		if (nC0) Screen.DrawShapeFill(Col(255, 235, 120), 0.95, core0);
+		if (nMid) Screen.DrawShapeFill(Col(80, 220, 255), 0.90, mid);         // siguiente paso: azul claro
+		if (nBig)
+		{
+			Color gc = Col(60, 255, 90);                                       // salida: verde
+			if (q.gObj == GCNav.OBJ_KILL) gc = Col(255, 60, 40);               // jefe: rojo
+			else if (q.gObj != GCNav.OBJ_EXIT) gc = Col(255, 200, 40);         // interruptor: dorado
+			Screen.DrawShapeFill(gc, 0.9, big);
+		}
+		if (nArG) Screen.DrawShapeFill(Col(0, 0, 0), 0.55, arrowG);
+		if (nAr) Screen.DrawShapeFill(Col(255, 200, 40), 0.95, arrow);
+		if (stepTxt != "") Label(stepTxt, stepX, stepY, Font.CR_LIGHTBLUE);
+		if (goalTxt != "")
+		{
+			Label(goalTxt, goalX, goalY - goalR - 11 * tsc, ColorFont(q));
+			Label(String.Format("%d M", int(rem / 32)), goalX, goalY + goalR + 3 * tsc, Font.CR_WHITE);
+		}
+		Screen.ClearClipRect();
+	}
+}

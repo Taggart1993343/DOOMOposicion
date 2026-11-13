@@ -1,0 +1,10 @@
+user noarchive int gc_temario_marca = 0;
+// Modo estudio: lo que has aprendido y los temas elegidos se guardan en el .ini de GZDoom de este ordenador
+nosave string gcq_progreso = "";
+nosave string gcq_temas = "";
+// 1 = SOLO FECHAS: en fácil solo salen preguntas de fechas, de todos los temas
+nosave int gcq_fechas = 0;
+// Tiempo jugado (total y por días), también en el .ini de este ordenador
+nosave string gcq_horas = "";
+// PvP: segundos que dura cada ronda (lo pone el anfitrión al crear la partida)
+server noarchive int gcq_pvp_segundos = 600;

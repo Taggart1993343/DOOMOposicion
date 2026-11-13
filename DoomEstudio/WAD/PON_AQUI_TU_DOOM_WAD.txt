@@ -1,0 +1,4 @@
+﻿Copia aquí tu DOOM.WAD de The Ultimate Doom (el de Steam o GOG vale).
+Opcional: tu DOOM2.WAD, para crear la súper escopeta con herramientas\crear_superescopeta.py.
+
+Los WAD de DOOM son de id Software y no se incluyen en este proyecto.
